@@ -1,0 +1,11 @@
+{
+  "wheel": "sqlglot-30.24.0-py3-none-any.whl",
+  "files": [
+    "__init__.py",
+    "parse.py",
+    "verilog.py",
+    "trace.py",
+    "cdc.py",
+    "web.py"
+  ]
+}

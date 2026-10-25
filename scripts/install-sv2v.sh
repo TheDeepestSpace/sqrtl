@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Install a pinned sv2v (SystemVerilog -> Verilog) release binary.
 #
-# sv2v is a tool for the equivalence check only: `sqrtl check --sv` converts
-# the generated SystemVerilog with it before handing the result to Icarus.
+# sv2v is a tool for the equivalence check only: `sqrtl check` converts the
+# generated SystemVerilog with it before handing the result to Icarus.
 # It is deliberately not a dependency of the sqrtl Python package.
 #
 # Usage: scripts/install-sv2v.sh [DEST_DIR]   (default: /usr/local/bin)

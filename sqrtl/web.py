@@ -2,7 +2,7 @@
 
 It depends only on parse.py, verilog.py and trace.py (no psycopg, no I/O):
 the page runs the SQL itself in PGlite and only needs the Design metadata,
-the generated Verilog and the trace queries.
+the generated SystemVerilog and the trace queries.
 """
 
 from __future__ import annotations
@@ -34,8 +34,7 @@ def analyze(design_sql: str) -> dict:
         "wires": [_sig(d.wire_signals[w]) for w, _ in d.wires],
         "outputs": d.outputs,
         "enums": d.enums,
-        "verilog": emit_verilog(d),
-        "systemverilog": emit_verilog(d, sv=True),
+        "systemverilog": emit_verilog(d),
         "stim_select": stim_select(d),
         "trace_select": trace_select(d),
     }

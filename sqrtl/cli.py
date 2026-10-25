@@ -38,7 +38,7 @@ def _write(text: str, out: str | None) -> None:
 
 def cmd_transpile(args: argparse.Namespace) -> int:
     _, _, design = _load(args.example_dir)
-    _write(emit_verilog(design, sv=args.sv), args.output)
+    _write(emit_verilog(design), args.output)
     return 0
 
 
@@ -54,7 +54,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     expected_path = d / "expected.csv"
     expected = expected_path.read_text() if expected_path.is_file() else None
     keep = Path(args.keep) if args.keep else None
-    return check(design, sql, _read_stim(d), expected, args.dsn, keep=keep, sv=args.sv)
+    return check(design, sql, _read_stim(d), expected, args.dsn, keep=keep)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,10 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"sqrtl {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
-    t = sub.add_parser("transpile", help="design.sql -> Verilog (stdout by default)")
+    t = sub.add_parser("transpile", help="design.sql -> SystemVerilog (stdout by default)")
     t.add_argument("example_dir")
-    t.add_argument("-o", "--output", metavar="out.v")
-    t.add_argument("--sv", action="store_true", help="emit SystemVerilog (logic, typedef enum, always_comb, always_ff)")
+    t.add_argument("-o", "--output", metavar="out.sv")
     t.set_defaults(func=cmd_transpile)
 
     s = sub.add_parser("sim", help="run the design in PostgreSQL and print the trace CSV")
@@ -74,11 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dsn", default=None, help="PostgreSQL DSN (default: $SQRTL_DSN, then postgresql://localhost/sqrtl)")
     s.set_defaults(func=cmd_sim)
 
-    c = sub.add_parser("check", help="sim + transpile + iverilog + diff; exit 0 on match, 1 on mismatch")
+    c = sub.add_parser("check", help="sim + transpile + sv2v + iverilog + diff; exit 0 on match, 1 on mismatch")
     c.add_argument("example_dir")
     c.add_argument("--dsn", default=None, help="PostgreSQL DSN (default: $SQRTL_DSN, then postgresql://localhost/sqrtl)")
-    c.add_argument("--keep", metavar="DIR", help="keep the Verilog, testbench and traces in DIR")
-    c.add_argument("--sv", action="store_true", help="transpile to SystemVerilog and run Icarus on its sv2v conversion")
+    c.add_argument("--keep", metavar="DIR", help="keep the SystemVerilog, its sv2v conversion, the testbench and traces in DIR")
     c.set_defaults(func=cmd_check)
     return p
 

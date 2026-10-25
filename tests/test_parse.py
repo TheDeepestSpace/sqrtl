@@ -275,7 +275,7 @@ def test_web_analyze_roundtrip():
     assert r["outputs"] == ["out_valid", "dout"]
     assert r["wires"] == [{"name": "din_plus1", "width": 8, "is_bool": False, "enum": None}]
     assert r["enums"] == {}
-    assert r["verilog"].startswith("module incrementer (")
+    assert "verilog" not in r
     assert r["systemverilog"].startswith("module incrementer (\n    input  logic")
     assert r["trace_select"] == "SELECT cycle, out_valid::int AS out_valid, dout::bigint AS dout FROM incrementer_out ORDER BY cycle"
     assert r["stim_select"] == "SELECT cycle, in_valid::int AS in_valid, din::bigint AS din FROM incrementer_in ORDER BY cycle"

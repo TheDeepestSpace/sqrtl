@@ -1,11 +1,16 @@
-"""Design -> Verilog-2005 or SystemVerilog text. Pure: no I/O, no sqlglot,
-deterministic output."""
+"""Design -> SystemVerilog text. Pure: no I/O, no sqlglot, deterministic output.
+
+The transpiler emits SystemVerilog only: `logic` ports and registers, a
+`typedef enum` per SQL enum, `always_comb` for LATERAL columns, `always_ff`
+for the register block, and `case` statements for simple CASE. Plain Verilog
+is one `sv2v` away, which is how `sqrtl check` feeds Icarus.
+"""
 
 from __future__ import annotations
 
 from .parse import Bin, Cond, Design, Expr, Lit, Ref, Signal, Switch, Un
 
-__all__ = ["emit_verilog", "emit_expr", "vrange"]
+__all__ = ["emit_verilog", "emit_expr", "emit_assign", "vrange"]
 
 
 def vrange(width: int) -> str:
@@ -57,39 +62,37 @@ def emit_assign(lhs: str, e: Expr, op: str, indent: str) -> list[str]:
     return lines
 
 
-def _kind(sig: Signal, sv: bool, default: str) -> str:
-    return sig.enum if (sv and sig.enum) else default
+def _kind(sig: Signal) -> str:
+    return sig.enum or "logic"
 
 
-def _decl(kind: str, sig: Signal, sv: bool) -> str:
-    rng = "" if (sv and sig.enum) else vrange(sig.width)
-    return f"{kind} {rng} {sig.name}" if rng else f"{kind} {sig.name}"
+def _range(sig: Signal) -> str:
+    return "" if sig.enum else vrange(sig.width)
 
 
-def emit_verilog(d: Design, sv: bool = False) -> str:
-    """Render the design. ``sv=False``: Verilog-2005 (wire/reg, always @(posedge clk),
-    enums as localparams). ``sv=True``: SystemVerilog (logic, typedef enum,
-    always_comb, always_ff)."""
+def _decl(sig: Signal) -> str:
+    rng = _range(sig)
+    return f"{_kind(sig)} {rng} {sig.name}" if rng else f"{_kind(sig)} {sig.name}"
+
+
+def emit_verilog(d: Design) -> str:
+    """Render the design as SystemVerilog."""
     regs = {r.name: r for r in d.regs}
     lines: list[str] = []
 
-    if sv:
-        for name, labels in d.enums.items():
-            w = Design.enum_width(labels)
-            members = ", ".join(f"{Design.member(l)} = {w}'d{k}" for k, l in enumerate(labels))
-            lines.append(f"typedef enum logic {vrange(w) or '[0:0]'} {{{members}}} {name};")
-        if d.enums:
-            lines.append("")
+    for name, labels in d.enums.items():
+        w = Design.enum_width(labels)
+        members = ", ".join(f"{Design.member(l)} = {w}'d{k}" for k, l in enumerate(labels))
+        lines.append(f"typedef enum logic {vrange(w) or '[0:0]'} {{{members}}} {name};")
+    if d.enums:
+        lines.append("")
 
-    ports: list[tuple[str, str, str, str]] = []
-    in_kind, reg_kind = ("logic", "logic") if sv else ("wire", "reg")
-    ports.append(("input", in_kind, "", "clk"))
-    ports.append(("input", in_kind, "", "rst"))
-    for s in d.inputs:
-        ports.append(("input", _kind(s, sv, in_kind), "" if (sv and s.enum) else vrange(s.width), s.name))
-    for o in d.outputs:
-        s = regs[o]
-        ports.append(("output", _kind(s, sv, reg_kind), "" if (sv and s.enum) else vrange(s.width), o))
+    ports: list[tuple[str, str, str, str]] = [
+        ("input", "logic", "", "clk"),
+        ("input", "logic", "", "rst"),
+    ]
+    ports += [("input", _kind(s), _range(s), s.name) for s in d.inputs]
+    ports += [("output", _kind(regs[o]), _range(regs[o]), o) for o in d.outputs]
     kind_w = max(len(p[1]) for p in ports)
     rng_w = max(len(p[2]) for p in ports)
 
@@ -102,31 +105,21 @@ def emit_verilog(d: Design, sv: bool = False) -> str:
             lines.append(f"    {direction:<6} {kind:<{kind_w}} {name}{comma}")
     lines.append(");")
 
-    if not sv:
-        for name, labels in d.enums.items():
-            w = Design.enum_width(labels)
-            for k, l in enumerate(labels):
-                lines.append(f"    localparam {vrange(w) + ' ' if w > 1 else ''}{Design.member(l)} = {w}'d{k};")
-
     for r in d.regs:
         if r.name not in d.outputs:
-            lines.append(f"    {_decl(_kind(r, sv, reg_kind), r, sv)};")
+            lines.append(f"    {_decl(r)};")
     for name, e in d.wires:
-        sig = d.wire_signals[name]
-        if sv:
-            lines.append(f"    {_decl(_kind(sig, sv, 'logic'), sig, sv)};")
-            body = emit_assign(name, e, "=", "        ")
-            if len(body) == 1:
-                lines.append(f"    always_comb {body[0].strip()}")
-            else:
-                lines.append("    always_comb begin")
-                lines += body
-                lines.append("    end")
+        lines.append(f"    {_decl(d.wire_signals[name])};")
+        body = emit_assign(name, e, "=", "        ")
+        if len(body) == 1:
+            lines.append(f"    always_comb {body[0].strip()}")
         else:
-            lines.append(f"    {_decl('wire', sig, sv)} = {emit_expr(e)};")
+            lines.append("    always_comb begin")
+            lines += body
+            lines.append("    end")
 
     lines.append("")
-    lines.append(f"    {'always_ff' if sv else 'always'} @(posedge clk) begin")
+    lines.append("    always_ff @(posedge clk) begin")
     lines.append("        if (rst) begin")
     for r in d.regs:
         lines.append(f"            {r.name} <= {emit_expr(d.reset[r.name])};")

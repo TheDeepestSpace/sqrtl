@@ -1,5 +1,5 @@
-// sqrtl web UI: edit design.sql / stim.sql on the left, read the Verilog on
-// the right, watch the waveform below. The transpiler is the real Python
+// sqrtl web UI: edit design.sql / stim.sql on the left, read the SystemVerilog
+// on the right, watch the waveform below. The transpiler is the real Python
 // package running under Pyodide; the simulator is the real PostgreSQL running
 // under PGlite. Nothing leaves the browser.
 
@@ -17,12 +17,7 @@ import { WAVE_SKIN_CSS } from "./waveskin.js";
 
 const $ = (id) => document.getElementById(id);
 const STORAGE_KEY = "sqrtl.v1";
-const TARGET_KEY = "sqrtl.target";
 const SCHEMA = "sqrtl_web";
-
-// Output language: "verilog" (Verilog-2005) or "sv" (SystemVerilog).
-let target = "verilog";
-try { if (localStorage.getItem(TARGET_KEY) === "sv") target = "sv"; } catch { /* ignore */ }
 
 // ---------------------------------------------------------------------------
 // Status / toast
@@ -154,7 +149,7 @@ $("copy").addEventListener("click", async () => {
   if (!text) return;
   try {
     await navigator.clipboard.writeText(text);
-    toast("Verilog copied");
+    toast("SystemVerilog copied");
   } catch {
     // Fallback: select all in the read-only editor.
     verilogView.dispatch({ selection: { anchor: 0, head: verilogView.state.doc.length } });
@@ -163,25 +158,9 @@ $("copy").addEventListener("click", async () => {
   }
 });
 
-const EXT = { verilog: "v", sv: "sv" };
-const segButtons = [...document.querySelectorAll(".seg-btn")];
-function applyTarget() {
-  for (const b of segButtons) b.setAttribute("aria-checked", String(b.dataset.target === target));
-  $("verilog-title").textContent = target === "sv" ? "SystemVerilog" : "Verilog";
-  if (lastMeta) showVerilog(lastMeta);
-}
-for (const b of segButtons) {
-  b.addEventListener("click", () => {
-    target = b.dataset.target;
-    try { localStorage.setItem(TARGET_KEY, target); } catch { /* ignore */ }
-    applyTarget();
-  });
-}
-
 function showVerilog(meta) {
-  const text = target === "sv" ? meta.systemverilog : meta.verilog;
-  if (getDoc(verilogView) !== text) setDoc(verilogView, text);
-  $("verilog-name").textContent = `${meta.name}.${EXT[target]}`;
+  if (getDoc(verilogView) !== meta.systemverilog) setDoc(verilogView, meta.systemverilog);
+  $("verilog-name").textContent = `${meta.name}.sv`;
 }
 
 $("download").addEventListener("click", () => {
@@ -191,7 +170,7 @@ $("download").addEventListener("click", () => {
   const blob = new Blob([text], { type: "text/plain" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `${name}.${EXT[target]}`;
+  a.download = `${name}.sv`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 });
@@ -464,7 +443,6 @@ async function boot() {
     || examples.find((e) => e.name === "incrementer") || examples[0];
   loadExample(ex, saved && saved.example === ex.name ? saved : {});
 
-  applyTarget();
   await Promise.all([loadPython(), loadPostgres()]);
   setStatus("ready", "Ready");
   run();

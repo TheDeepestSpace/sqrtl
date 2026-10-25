@@ -1,10 +1,10 @@
 # Developer entry points. The Python package itself needs only sqlglot and
 # psycopg; everything here is tooling around it.
 #
-#   make tools      install sv2v (pinned release) for `sqrtl check --sv`
-#   make test       pytest (needs a PostgreSQL at $SQRTL_DSN and iverilog)
-#   make check      sqrtl check on every example, Verilog-2005 target
-#   make check-sv   sqrtl check --sv on every example (SystemVerilog -> sv2v -> Icarus)
+#   make tools      install sv2v (pinned release); `sqrtl check` converts the
+#                   generated SystemVerilog with it before running Icarus
+#   make test       pytest (needs a PostgreSQL at $SQRTL_DSN, iverilog and sv2v)
+#   make check      sqrtl check on every example
 #   make web        build the browser playground into web/dist
 #   make serve      serve web/dist on http://localhost:8000
 
@@ -12,7 +12,7 @@ PYTHON ?= python3
 EXAMPLES := $(wildcard examples/*/)
 SV2V_DEST ?= /usr/local/bin
 
-.PHONY: tools test check check-sv web serve clean
+.PHONY: tools test check web serve clean
 
 tools:
 	scripts/install-sv2v.sh $(SV2V_DEST)
@@ -22,9 +22,6 @@ test:
 
 check:
 	@for d in $(EXAMPLES); do sqrtl check "$$d" || exit 1; done
-
-check-sv:
-	@for d in $(EXAMPLES); do sqrtl check --sv "$$d" || exit 1; done
 
 web:
 	npm ci --no-audit --no-fund

@@ -40,7 +40,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends iverilog
           iverilog -V | head -n1
 
-      - name: Install sv2v (SystemVerilog -> Verilog, for `sqrtl check --sv`)
+      - name: Install sv2v (SystemVerilog -> Verilog, used by `sqrtl check` before Icarus)
         run: scripts/install-sv2v.sh "$HOME/.local/bin"
 
       - name: Install sqrtl
@@ -52,9 +52,8 @@ jobs:
       - name: Test
         run: .venv/bin/pytest
 
-      - name: Check every example (Verilog-2005 and SystemVerilog via sv2v)
+      - name: Check every example
         run: |
           for d in examples/*/; do
             .venv/bin/sqrtl check "$d"
-            .venv/bin/sqrtl check --sv "$d"
           done

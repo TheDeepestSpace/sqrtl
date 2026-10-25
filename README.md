@@ -6,17 +6,15 @@ sqrtl is a toy hardware description language where the design file is a
 PostgreSQL query. A design is one `CREATE TABLE` (the input ports) and one
 `CREATE VIEW` whose body is a `WITH RECURSIVE` CTE: every row of the CTE is the
 register state after one clock edge. PostgreSQL *is* the simulator, and a small
-Python transpiler turns the same file into synthesizable Verilog-2005 or
-SystemVerilog. The proof of correctness is `sqrtl check`: the trace PostgreSQL
-produces and the trace Icarus Verilog produces from the generated module must
-be byte-identical.
+Python transpiler turns the same file into synthesizable SystemVerilog. The
+proof of correctness is `sqrtl check`: the trace PostgreSQL produces and the
+trace Icarus Verilog produces from the generated module (converted with sv2v)
+must be byte-identical.
 
 ```sh
 sqrtl sim       examples/incrementer      # run the design in Postgres, print the trace CSV
-sqrtl transpile examples/incrementer      # design.sql -> Verilog-2005 on stdout
-sqrtl transpile examples/seqdet --sv      # design.sql -> SystemVerilog (logic, typedef enum, always_ff)
-sqrtl check     examples/incrementer      # sim + transpile + iverilog + diff; exit 0 on match
-sqrtl check     examples/seqdet --sv      # same, SystemVerilog converted with sv2v before Icarus
+sqrtl transpile examples/incrementer      # design.sql -> SystemVerilog on stdout
+sqrtl check     examples/incrementer      # sim + transpile + sv2v + iverilog + diff; exit 0 on match
 ```
 
 What it does not do (v1): one clock, one synchronous reset, no memories, no
@@ -25,17 +23,16 @@ See [Future work](#future-work).
 
 ## Quick start
 
-Requirements: Python 3.11+, a PostgreSQL 15+ server, and Icarus Verilog
-(`iverilog`, `vvp`) on `PATH`. For `check --sv` you also need
-[sv2v](https://github.com/zachjs/sv2v); `make tools` installs a pinned release
-(it is a tool for the check, not a dependency of the package).
+Requirements: Python 3.11+, a PostgreSQL 15+ server, Icarus Verilog
+(`iverilog`, `vvp`) and [sv2v](https://github.com/zachjs/sv2v) on `PATH`.
+`make tools` installs a pinned sv2v release; it is a tool for the check, not a
+dependency of the package. `transpile` and `sim` need neither.
 
 ```sh
 pip install -e '.[test]'
-make tools                                      # sv2v, optional
+make tools                                      # sv2v
 export SQRTL_DSN=postgresql://localhost/sqrtl   # default; any psycopg DSN works
 make check                                      # sqrtl check on every example
-make check-sv                                   # same through SystemVerilog + sv2v
 pytest
 ```
 
@@ -79,18 +76,19 @@ SELECT cycle, out_valid, dout FROM sim;
 
 </td><td>
 
-```verilog
+```systemverilog
 module incrementer (
-    input  wire       clk,
-    input  wire       rst,
-    input  wire       in_valid,
-    input  wire [7:0] din,
-    output reg        out_valid,
-    output reg  [7:0] dout
+    input  logic       clk,
+    input  logic       rst,
+    input  logic       in_valid,
+    input  logic [7:0] din,
+    output logic       out_valid,
+    output logic [7:0] dout
 );
-    wire [7:0] din_plus1 = (din + 8'd1);
+    logic [7:0] din_plus1;
+    always_comb din_plus1 = (din + 8'd1);
 
-    always @(posedge clk) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             out_valid <= 1'b0;
             dout <= 8'd0;
@@ -189,8 +187,8 @@ WITH RECURSIVE sim(cycle, state, detected) AS (
 SELECT cycle, state, detected FROM sim;
 ```
 
-With `--sv` the enum becomes a `typedef enum`, the register block an
-`always_ff`, and the simple `CASE` a `case` statement:
+The enum becomes a `typedef enum`, the register block an `always_ff`, and the
+simple `CASE` a `case` statement:
 
 ```systemverilog
 typedef enum logic [1:0] {IDLE = 2'd0, SAW_1 = 2'd1, SAW_10 = 2'd2} state_t;
@@ -219,17 +217,15 @@ module seqdet (
 endmodule
 ```
 
-The Verilog-2005 target emits the same `case` with the members as
-`localparam`s and the state as `reg [1:0]`. In the trace an enum is its
-ordinal (`idle` = 0), so `expected.csv` is encoding-independent.
+In the trace an enum is its ordinal (`idle` = 0), so `expected.csv` is
+encoding-independent.
 
 ## Web UI
 
 The repository also ships a browser playground, deployed to GitHub Pages from
 `web/` by `.github/workflows/pages.yml`: a CodeMirror editor for `design.sql`
-and `stim.sql` on the left, the transpiled Verilog-2005 or SystemVerilog
-(switchable, read-only, one-click copy or download) on the right, and a
-WaveDrom waveform of the simulation below, with inputs and outputs grouped and
+and `stim.sql` on the left, the transpiled SystemVerilog (read-only, one-click
+copy or download) on the right, and a WaveDrom waveform of the simulation below, with inputs and outputs grouped and
 enum registers shown by label. It runs entirely client-side: the real
 transpiler executes under [Pyodide](https://pyodide.org) and the real
 simulator is PostgreSQL compiled to WebAssembly via
@@ -251,16 +247,16 @@ A `design.sql` holds, in this order, any number of enum definitions and then
 exactly two statements:
 
 0. **Enums (optional).** `CREATE TYPE <name> AS ENUM ('label', ...)`. An enum
-   column is `ceil(log2(n))` bits wide (at least 1); labels are emitted as
-   upper-case Verilog identifiers (`'saw_1'` becomes `SAW_1`), as a
-   `typedef enum` in SystemVerilog and as `localparam`s in Verilog-2005.
+   column is `ceil(log2(n))` bits wide (at least 1) and becomes a
+   `typedef enum logic [w-1:0] {...} <name>;` whose members are the labels in
+   upper case (`'saw_1'` becomes `SAW_1`).
 1. **The port table.** `CREATE TABLE <name>_in (...)` declares the inputs. It
    must have `cycle integer PRIMARY KEY` plus one `NOT NULL` column per input
    port; the column types are the port widths.
 2. **The design view.** `CREATE VIEW <name>_out AS WITH RECURSIVE sim(...) AS
    (<base> UNION ALL <step>) SELECT ... FROM sim;`. The CTE must be named
    `sim`, its first column must be `cycle`, and every other column is a
-   register (`output reg`). The base case is the reset state and must be
+   register (`output logic`). The base case is the reset state and must be
    literals. The outer `SELECT` lists `cycle` and the registers that become
    module outputs, in port order.
 
@@ -273,21 +269,21 @@ JOIN <name>_in i ON i.cycle = s.cycle
 ```
 
 `s` is the current state, `i` the inputs for that cycle, and every `LATERAL`
-column becomes a Verilog `wire`; laterals may reference `s`, `i` and earlier
+column becomes an `always_comb` signal; laterals may reference `s`, `i` and earlier
 lateral aliases. A lateral may not contain `FROM`.
 
 ### Types
 
-| SQL type  | Verilog                | Notes                                   |
+| SQL type  | SystemVerilog          | Notes                                   |
 | --------- | ---------------------- | --------------------------------------- |
-| `boolean` | `wire` / `reg` (1 bit) | control signals                         |
-| `bit(n)`  | `[n-1:0]`              | data; `n` from 1 to 64                  |
-| enum type | `[w-1:0]` / `typedef enum` | `w = ceil(log2(labels))`; compare and `CASE` only |
+| `boolean` | `logic` (1 bit)        | control signals                         |
+| `bit(n)`  | `logic [n-1:0]`        | data; `n` from 1 to 64                  |
+| enum type | `typedef enum logic [w-1:0]` | `w = ceil(log2(labels))`; compare and `CASE` only |
 | `integer` | error                  | only allowed for `cycle`                |
 
 ### Expressions
 
-| SQL                                   | Verilog                     | Operand rule                               |
+| SQL                                   | SystemVerilog               | Operand rule                               |
 | ------------------------------------- | --------------------------- | ------------------------------------------ |
 | `a AND b`, `a OR b`, `NOT a`          | `a && b`, `a \|\| b`, `!a`  | boolean only                               |
 | `a <> b`, `a = b`                     | `a != b`, `a == b`          | same type both sides                       |
@@ -350,47 +346,48 @@ Every row below has a test in `tests/test_parse.py`.
 | every branch of a CASE is a bare label           | `CASE needs a typed branch (write one label as 'label'::enum)` |
 
 `sqrtl check` exits 1 and prints a unified diff when the PostgreSQL trace, the
-Icarus trace and `expected.csv` (if present) disagree. Any `iverilog -Wall`
-warning is also a failure.
+Icarus trace and `expected.csv` (if present) disagree. Any sv2v or
+`iverilog -Wall` diagnostic is also a failure.
 
-## Targets
+## Output
 
-`sqrtl transpile` emits Verilog-2005 by default and SystemVerilog with `--sv`:
+The transpiler emits SystemVerilog, and only SystemVerilog:
 
-| | Verilog-2005 | SystemVerilog (`--sv`) |
-| --- | --- | --- |
-| ports and registers | `wire` / `reg` | `logic`, enum ports typed with their `typedef` |
-| wires (`LATERAL` columns) | `wire x = expr;` | `logic x; always_comb x = expr;` (a `case` gets a `begin … end` block) |
-| register block | `always @(posedge clk)` | `always_ff @(posedge clk)` |
-| enums | `localparam [w-1:0] LABEL = …` | `typedef enum logic [w-1:0] {…} name;` before the module |
-| simple `CASE` on a register | `case … endcase` | `case … endcase` |
+| SQL | SystemVerilog |
+| --- | --- |
+| ports and registers | `logic`; enum-typed ones use their `typedef` |
+| `LATERAL` columns | `logic x; always_comb x = expr;` (a `case` gets a `begin … end` block) |
+| the recursive step | one `always_ff @(posedge clk)` with a synchronous `rst` |
+| enums | `typedef enum logic [w-1:0] {…} name;` before the module |
+| simple `CASE` | `case … endcase` |
 
-Both are what the transpiler hands you; do with them what you like. For the
-equivalence check, `sqrtl check --sv` converts the SystemVerilog with
-[sv2v](https://github.com/zachjs/sv2v) and runs the result through
-`iverilog -Wall -g2005`, so Icarus sees plain Verilog either way. sv2v is a
-tool installed by `make tools` (or `scripts/install-sv2v.sh`), pinned by
-version and checksum, and is not a dependency of the Python package.
+What you do with it is up to you. For the equivalence check, `sqrtl check`
+converts the output with [sv2v](https://github.com/zachjs/sv2v) and runs the
+result through `iverilog -Wall -g2005`, so Icarus only ever sees plain Verilog
+and any sv2v or iverilog diagnostic fails the check. sv2v is installed by
+`make tools` (or `scripts/install-sv2v.sh`), pinned by version and checksum,
+and is not a dependency of the Python package. `sqrtl check --keep DIR` leaves
+the `.sv`, its conversion, the testbench and both traces behind.
 
 ## How it works
 
 ```
-design.sql --sqlglot--> parse.py --> Design --> verilog.py --> <name>.v
-                                      |
+design.sql --sqlglot--> parse.py --> Design --> verilog.py --> <name>.sv --sv2v--> <name>.v
+                                      |                                              |
                                       +--> sim.py (psycopg, COPY ... CSV) --> trace_pg.csv
-                                      +--> testbench.py --> tb.v --iverilog/vvp--> trace_iv.csv
+                                      +--> testbench.py --> tb.v --------iverilog/vvp--> trace_iv.csv
 ```
 
 - `sqrtl/parse.py` lowers the sqlglot AST into a tiny expression tree
   (`Ref`, `Lit`, `Un`, `Bin`, `Cond`, `Switch`) and rejects anything outside the subset.
-- `sqrtl/verilog.py` prints a `Design` as Verilog-2005 or SystemVerilog.
-  Output is deterministic; every binary expression is parenthesized and every
-  literal is sized. A simple `CASE` (`Switch` in the expression tree) becomes
-  a `case` statement wherever a statement is allowed.
+- `sqrtl/verilog.py` prints a `Design` as SystemVerilog. Output is
+  deterministic; every binary expression is parenthesized and every literal is
+  sized. A simple `CASE` (`Switch` in the expression tree) becomes a `case`
+  statement wherever a statement is allowed.
 - `sqrtl/sim.py` runs the design in a throwaway schema and exports the trace
   and the stimulus as CSV with `COPY`.
-- `sqrtl/check.py` renders a per-design testbench, runs `iverilog -Wall -g2005`
-  and `vvp`, and diffs the traces.
+- `sqrtl/check.py` renders a per-design testbench, converts the SystemVerilog
+  with `sv2v`, runs `iverilog -Wall -g2005` and `vvp`, and diffs the traces.
 - `sqrtl/trace.py` holds the trace-rendering SQL shared by `sim.py` and
   `sqrtl/web.py`, the entry point the web UI calls under Pyodide.
 
@@ -405,8 +402,8 @@ same Dockerfile is the minimal environment; both images are published to GHCR
 by `.github/workflows/docker-build.yml`.
 
 CI (`.github/workflows/ci.yml`) runs `pytest` against a PostgreSQL 16 service
-container with `iverilog` and `sv2v` installed, then `sqrtl check` and
-`sqrtl check --sv` on every directory under `examples/`. The equivalence tests read the DSN from `SQRTL_DSN` and are skipped
+container with `iverilog` and `sv2v` installed, then `sqrtl check` on every
+directory under `examples/`. The equivalence tests read the DSN from `SQRTL_DSN` and are skipped
 locally when no server is reachable.
 
 ## Future work
@@ -420,5 +417,6 @@ Explicitly out of scope for v1:
 - `CHECK` constraints as assertions.
 - Any optimization of the generated Verilog.
 - Support for any database other than PostgreSQL 15+.
-- Running the Icarus equivalence check in the browser.
+- Running the sv2v + Icarus equivalence check in the browser.
+- A Verilog-2005 emitter (use sv2v on the output).
 - Three-valued logic as X-propagation.

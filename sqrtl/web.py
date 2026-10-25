@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 
+from .cdc import cdc_warnings
 from .parse import Signal, SqrtlError, parse_design
 from .trace import stim_select, trace_select
 from .verilog import emit_verilog
@@ -17,7 +18,7 @@ __all__ = ["analyze", "analyze_json"]
 
 
 def _sig(s: Signal) -> dict:
-    return {"name": s.name, "width": s.width, "is_bool": s.is_bool, "enum": s.enum}
+    return {"name": s.name, "width": s.width, "is_bool": s.is_bool, "enum": s.enum, "is_clock": s.is_clock}
 
 
 def analyze(design_sql: str) -> dict:
@@ -34,6 +35,9 @@ def analyze(design_sql: str) -> dict:
         "wires": [_sig(d.wire_signals[w]) for w, _ in d.wires],
         "outputs": d.outputs,
         "enums": d.enums,
+        "clocks": d.clock_names(),
+        "domain": d.domain,
+        "warnings": [{"message": w.message, "line": w.line, "col": w.col} for w in cdc_warnings(d)],
         "systemverilog": emit_verilog(d),
         "stim_select": stim_select(d),
         "trace_select": trace_select(d),

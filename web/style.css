@@ -141,6 +141,8 @@ a.btn { text-decoration: none; }
 .status[data-state="loading"] .dot { background: var(--clk); animation: pulse 1.1s ease-in-out infinite; }
 .status[data-state="ready"] .dot { background: var(--ok); box-shadow: 0 0 8px rgba(115, 218, 202, 0.6); }
 .status[data-state="busy"] .dot { background: var(--accent); animation: pulse 0.8s ease-in-out infinite; }
+.status[data-state="warn"] .dot { background: var(--clk); box-shadow: 0 0 8px rgba(224, 175, 104, 0.6); }
+.status[data-state="warn"] { color: var(--clk); border-color: rgba(224, 175, 104, 0.5); }
 .status[data-state="error"] { color: var(--warn); border-color: rgba(247, 118, 142, 0.5); }
 .status[data-state="error"] .dot { background: var(--warn); }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
@@ -195,6 +197,9 @@ a.btn { text-decoration: none; }
   margin-left: 8px;
 }
 .note.error { color: var(--warn); }
+.note.warn { color: var(--clk); }
+.cm-lintRange-warning { background-image: none; text-decoration: underline wavy var(--clk); text-underline-offset: 3px; }
+.cm-diagnostic-warning { border-left-color: var(--clk); }
 .actions { display: flex; gap: 6px; align-items: center; }
 .pane-body {
   flex: 1;

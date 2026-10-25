@@ -78,6 +78,20 @@ function setDoc(view, text) {
 }
 const getDoc = (view) => view.state.doc.toString();
 
+// CDC lint warnings are shown as warning diagnostics on the register names.
+function showWarnings(warnings) {
+  const doc = designView.state.doc;
+  const diagnostics = warnings.filter((w) => w.line).map((w) => {
+    const line = doc.line(Math.min(Math.max(w.line, 1), doc.lines));
+    const from = Math.min(line.from + Math.max((w.col || 1) - 1, 0), line.to);
+    const m = /^[A-Za-z0-9_]+/.exec(doc.sliceString(from, line.to));
+    return { from, to: Math.max(from + (m ? m[0].length : 1), from + 1), severity: "warning", message: w.message };
+  });
+  designView.dispatch(setDiagnostics(designView.state, diagnostics));
+  $("sql-note").textContent = warnings.length ? `${warnings.length} CDC warning${warnings.length > 1 ? "s" : ""}` : "";
+  $("sql-note").classList.toggle("warn", warnings.length > 0);
+}
+
 function setError(view, err) {
   // err: {message, line, col} or null
   let diagnostics = [];
@@ -244,6 +258,7 @@ async function run() {
   $("sql-note").classList.remove("error");
   lastMeta = result;
   showVerilog(result);
+  showWarnings(result.warnings || []);
 
   setStatus("busy", "Simulating in PostgreSQL…");
   try {
@@ -254,7 +269,9 @@ async function run() {
     renderWave(result, stimRows, traceRows);
     const cycles = traceRows.length;
     $("wave-note").textContent = `${cycles} cycles`;
-    setStatus("ready", `${result.name}: ${cycles} cycles simulated`);
+    const nw = (result.warnings || []).length;
+    if (nw) setStatus("warn", `${result.name}: ${cycles} cycles simulated, ${nw} CDC warning${nw > 1 ? "s" : ""}: ${result.warnings[0].message}`);
+    else setStatus("ready", `${result.name}: ${cycles} cycles simulated`);
   } catch (e) {
     if (id !== runId) return;
     const msg = (e && e.message) || String(e);
@@ -309,47 +326,62 @@ const waveSkin = { default: skin };
 // their bricks by SLOPE_HALF so each value crossing is centred on the boundary.
 const SLOPE_HALF = 6;
 
+const SUB = 2; // wave characters per tick: clocks rise at a tick's start and fall mid-tick
+
 function laneFor(sig, values, color) {
-  // values: array of strings or null (unknown) per column; '.' compresses repeats.
+  // values: array of strings or null (unknown) per tick; '.' compresses repeats.
   let wave = "";
   const data = [];
   let prev = undefined;
   for (const v of values) {
-    if (v === null) { wave += "x"; prev = null; continue; }
-    if (v === prev) { wave += "."; continue; }
+    if (v === null) { wave += "x" + ".".repeat(SUB - 1); prev = null; continue; }
+    if (v === prev) { wave += ".".repeat(SUB); continue; }
     prev = v;
-    if (sig.width === 1 && !sig.enum) wave += v === "1" ? "h" : "l";
-    else { wave += color; data.push(v); }
+    if (sig.width === 1 && !sig.enum) wave += (v === "1" ? "h" : "l") + ".".repeat(SUB - 1);
+    else { wave += color + ".".repeat(SUB - 1); data.push(v); }
   }
   const lane = { name: sig.name, wave, bus: sig.width > 1 || !!sig.enum };
   if (data.length) lane.data = data;
   return lane;
 }
 
-function renderWave(meta, stimRows, traceRows) {
-  const n = traceRows.length; // cycles 0..n-1 ; stimRows.length === n-1
-  const cols = n + 1; // one extra leading column for the reset clock
-  const ticks = ["rst", ...Array.from({ length: n }, (_, k) => String(k))];
+// A clock lane: a rising edge at the start of every tick it is flagged for
+// (high for the first half of the tick), the reset tick included.
+function clockLane(name, edges) {
+  let wave = "";
+  for (const e of edges) wave += e ? "hl" + ".".repeat(SUB - 2) : ".".repeat(SUB);
+  return { name, wave };
+}
 
-  // Input lanes stop after the last stimulus row: there is nothing to sample
-  // at the final edge, and the lane ending early says so without a glyph.
+function renderWave(meta, stimRows, traceRows) {
+  const n = traceRows.length; // ticks 0..n-1 ; stimRows.length === n-1
+  const cols = n + 1; // one extra leading column for the reset edges
+  const ticks = ["rst", ...Array.from({ length: n }, (_, k) => String(k))];
+  const declared = meta.clocks.length > 1 || meta.inputs.some((s) => s.is_clock);
+
   // Enum columns arrive as ordinals (the trace format); show the labels.
   const show = (sig, v) => (sig.enum && meta.enums[sig.enum] ? (meta.enums[sig.enum][Number(v)] ?? String(v)) : String(v));
-  const inputs = meta.inputs.map((sig) =>
+  // Input lanes stop after the last stimulus row: there is nothing to sample
+  // at the final edge, and the lane ending early says so without a glyph.
+  const inputs = meta.inputs.filter((s) => !s.is_clock).map((sig) =>
     laneFor(sig, [null, ...stimRows.map((r) => show(sig, r[sig.name]))], "5"));
   const regs = Object.fromEntries(meta.regs.map((r) => [r.name, r]));
   const outputs = meta.outputs.map((name) =>
     laneFor(regs[name], [null, ...traceRows.map((r) => show(regs[name], r[name]))], "7"));
 
+  // Column k+1 starts with the edge that produced state row k+1: the clocks
+  // flagged in stimulus row k. The reset column has an edge on every clock.
+  const clocks = meta.clocks.map((name) =>
+    clockLane(name, [true, ...traceRows.map((_, k) => (k === 0 ? true : declared ? String(stimRows[k - 1][name]) === "1" : true))]));
   const signal = [
-    { name: "clk", wave: "p" + ".".repeat(cols - 1) },
-    { name: "rst", wave: "hl" + ".".repeat(cols - 2) },
-    { name: "cycle", wave: "=".repeat(cols), data: ticks, bus: true },
+    ...clocks,
+    { name: "rst", wave: "h" + ".".repeat(SUB - 1) + "l" + ".".repeat(SUB * (cols - 1) - 1) },
+    { name: "cycle", wave: ("=" + ".".repeat(SUB - 1)).repeat(cols), data: ticks, bus: true },
   ];
   if (inputs.length) signal.push({}, { name: "INPUTS" }, ...inputs);
   if (outputs.length) signal.push({}, { name: "OUTPUTS" }, ...outputs);
 
-  const hscale = cols <= 12 ? 3 : cols <= 40 ? 2 : 1;
+  const hscale = cols <= 14 ? 2 : 1;
   const src = { signal, config: { hscale } };
   const host = $("wave");
   const buses = new Set(signal.filter((l) => l && l.bus).map((l) => l.name));
@@ -373,7 +405,7 @@ function colorLanes(host, meta, buses) {
     const label = g.querySelector("text");
     const name = label ? label.textContent.trim() : "";
     if (buses.has(name)) alignBusLane(g);
-    const cls = name === "clk" ? "lane-clk"
+    const cls = meta.clocks.includes(name) ? "lane-clk"
       : name === "rst" ? "lane-rst"
       : name === "cycle" ? "lane-cycle"
       : name === "INPUTS" || name === "OUTPUTS" ? "lane-header"

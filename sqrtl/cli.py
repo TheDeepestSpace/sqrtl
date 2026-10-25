@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .cdc import cdc_warnings
 from .check import check
 from .parse import Design, SqrtlError, parse_design
 from .sim import default_dsn, run_sim
@@ -19,7 +20,10 @@ def _load(example_dir: str) -> tuple[Path, str, Design]:
     if not design_path.is_file():
         raise SqrtlError(f"{design_path} not found")
     sql = design_path.read_text()
-    return d, sql, parse_design(sql)
+    design = parse_design(sql)
+    for w in cdc_warnings(design):
+        print(f"{design_path}:{w.line}:{w.col}: warning: {w.message}", file=sys.stderr)
+    return d, sql, design
 
 
 def _read_stim(d: Path) -> str:

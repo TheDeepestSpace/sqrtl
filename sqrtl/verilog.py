@@ -1,8 +1,8 @@
 """Design -> SystemVerilog text. Pure: no I/O, no sqlglot, deterministic output.
 
 The transpiler emits SystemVerilog only: `logic` ports and registers, a
-`typedef enum` per SQL enum, `always_comb` for LATERAL columns, `always_ff`
-for the register block, and `case` statements for simple CASE. Plain Verilog
+`typedef enum` per SQL enum, `always_comb` for LATERAL columns, one
+`always_ff` per clock domain, and `case` statements for simple CASE. Plain Verilog
 is one `sv2v` away, which is how `sqrtl check` feeds Icarus.
 """
 
@@ -87,11 +87,9 @@ def emit_verilog(d: Design) -> str:
     if d.enums:
         lines.append("")
 
-    ports: list[tuple[str, str, str, str]] = [
-        ("input", "logic", "", "clk"),
-        ("input", "logic", "", "rst"),
-    ]
-    ports += [("input", _kind(s), _range(s), s.name) for s in d.inputs]
+    ports: list[tuple[str, str, str, str]] = [("input", "logic", "", c) for c in d.clock_names()]
+    ports.append(("input", "logic", "", "rst"))
+    ports += [("input", _kind(s), _range(s), s.name) for s in d.data_inputs]
     ports += [("output", _kind(regs[o]), _range(regs[o]), o) for o in d.outputs]
     kind_w = max(len(p[1]) for p in ports)
     rng_w = max(len(p[2]) for p in ports)
@@ -118,15 +116,17 @@ def emit_verilog(d: Design) -> str:
             lines += body
             lines.append("    end")
 
-    lines.append("")
-    lines.append("    always_ff @(posedge clk) begin")
-    lines.append("        if (rst) begin")
-    for r in d.regs:
-        lines.append(f"            {r.name} <= {emit_expr(d.reset[r.name])};")
-    lines.append("        end else begin")
-    for r in d.regs:
-        lines += emit_assign(r.name, d.next[r.name], "<=", "            ")
-    lines.append("        end")
-    lines.append("    end")
+    for clock in d.clock_names():
+        regs_here = [r for r in d.regs if d.domain.get(r.name, "clk") == clock]
+        lines.append("")
+        lines.append(f"    always_ff @(posedge {clock}) begin")
+        lines.append("        if (rst) begin")
+        for r in regs_here:
+            lines.append(f"            {r.name} <= {emit_expr(d.reset[r.name])};")
+        lines.append("        end else begin")
+        for r in regs_here:
+            lines += emit_assign(r.name, d.next[r.name], "<=", "            ")
+        lines.append("        end")
+        lines.append("    end")
     lines.append("endmodule")
     return "\n".join(lines) + "\n"

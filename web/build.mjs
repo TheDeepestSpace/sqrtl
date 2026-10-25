@@ -54,7 +54,7 @@ fs.cpSync(pgSrc, pgDst, { recursive: true, filter: (src) => !skip(path.basename(
 // 5. Python: sqrtl modules the browser needs + the sqlglot wheel
 const pyDst = path.join(dist, "py");
 fs.mkdirSync(path.join(pyDst, "sqrtl"), { recursive: true });
-const pyFiles = ["__init__.py", "parse.py", "verilog.py", "trace.py", "web.py"];
+const pyFiles = ["__init__.py", "parse.py", "verilog.py", "trace.py", "cdc.py", "web.py"];
 for (const f of pyFiles) fs.copyFileSync(path.join(root, "sqrtl", f), path.join(pyDst, "sqrtl", f));
 const wheel = `sqlglot-${SQLGLOT_VERSION}-py3-none-any.whl`;
 const cache = path.join(web, ".cache");

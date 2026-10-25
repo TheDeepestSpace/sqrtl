@@ -8,6 +8,7 @@ text of design.sql.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Union
@@ -98,6 +99,7 @@ class Signal:
     width: int  # 1 for boolean
     is_bool: bool
     enum: str | None = None  # SQL enum type name, if the signal is an enum
+    is_clock: bool = False  # a `clock` port: true in a stimulus row when it rises at the end of that tick
 
     @property
     def sql_type(self) -> str:
@@ -117,6 +119,16 @@ class Design:
     next: dict[str, Expr]
     wire_signals: dict[str, Signal] = field(default_factory=dict)
     enums: dict[str, list[str]] = field(default_factory=dict)  # type name -> labels, in order
+    clocks: list[str] = field(default_factory=list)  # declared clock ports, table order; [] = implicit `clk`
+    domain: dict[str, str] = field(default_factory=dict)  # reg name -> clock name
+    reg_pos: dict[str, tuple[int, int]] = field(default_factory=dict)  # reg name -> (line, col) in design.sql
+
+    def clock_names(self) -> list[str]:
+        return self.clocks or ["clk"]
+
+    @property
+    def data_inputs(self) -> list[Signal]:
+        return [s for s in self.inputs if not s.is_clock]
 
     @staticmethod
     def enum_width(labels: list[str]) -> int:
@@ -203,6 +215,10 @@ class _Parser:
         self.wires: list[tuple[str, Expr]] = []
         self.wire_signals: dict[str, Signal] = {}
         self.enums: dict[str, list[str]] = {}
+        self.clock_types: set[str] = set()
+        self.clocks: list[str] = []
+        self.domain: dict[str, str] = {}
+        self.reg_pos: dict[str, tuple[int, int]] = {}
 
     # -- diagnostics -------------------------------------------------------
 
@@ -233,14 +249,26 @@ class _Parser:
     # -- entry -------------------------------------------------------------
 
     def parse(self) -> Design:
+        # sqlglot logs a warning when it falls back to a raw Command (CREATE DOMAIN);
+        # that fallback is expected here, so keep the log quiet for this call.
+        logger = logging.getLogger("sqlglot")
+        level = logger.level
+        logger.setLevel(logging.ERROR)
         try:
             stmts = [s for s in sqlglot.parse(self.src, dialect="postgres") if s is not None]
         except ParseError as e:
             info = e.errors[0] if e.errors else {}
             raise SqrtlError(f"syntax error: {info.get('description', e)}",
                              info.get("line", 1), info.get("col", 1)) from None
-        while stmts and isinstance(stmts[0], exp.Create) and stmts[0].args.get("kind") == "TYPE":
-            self.parse_enum(stmts.pop(0))
+        finally:
+            logger.setLevel(level)
+        while stmts:
+            if isinstance(stmts[0], exp.Create) and stmts[0].args.get("kind") == "TYPE":
+                self.parse_enum(stmts.pop(0))
+            elif isinstance(stmts[0], exp.Command) and str(stmts[0].this).upper() == "CREATE":
+                self.parse_domain(stmts.pop(0))
+            else:
+                break
         if (len(stmts) != 2
                 or not isinstance(stmts[0], exp.Create) or stmts[0].args.get("kind") != "TABLE"
                 or not isinstance(stmts[1], exp.Create) or stmts[1].args.get("kind") != "VIEW"):
@@ -258,7 +286,24 @@ class _Parser:
             next=nxt,
             wire_signals=self.wire_signals,
             enums=self.enums,
+            clocks=self.clocks,
+            domain=self.domain,
+            reg_pos=self.reg_pos,
         )
+
+    # -- CREATE DOMAIN <name> AS boolean (a clock type) -----------------------
+
+    _DOMAIN_RE = re.compile(r"\s*DOMAIN\s+([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+boolean\s*;?\s*\Z", re.IGNORECASE)
+
+    def parse_domain(self, cmd: exp.Command) -> None:
+        # sqlglot has no node for CREATE DOMAIN and keeps the statement text.
+        m = self._DOMAIN_RE.match(str(cmd.expression))
+        if not m:
+            raise self.err(f"unsupported statement: CREATE {str(cmd.expression).strip()}", cmd)
+        name = self.check_name(m.group(1), cmd)
+        if name in self.clock_types or name in self.enums:
+            raise self.err(f"duplicate name: {name}", cmd)
+        self.clock_types.add(name)
 
     # -- CREATE TYPE <name> AS ENUM (...) -----------------------------------
 
@@ -340,6 +385,8 @@ class _Parser:
                 if not isinstance(k, exp.NotNullColumnConstraint):
                     raise self.err(f"unsupported constraint on column {col}", cd)
             self.inputs[col] = sig
+            if sig.is_clock:
+                self.clocks.append(col)
         if not cycle_ok:
             raise self.err("port table needs cycle integer PRIMARY KEY", schema)
 
@@ -348,6 +395,10 @@ class _Parser:
             enum = self._enum_of(dt)
             if enum:
                 return Signal(col, Design.enum_width(self.enums[enum]), False, enum)
+            if dt.this == exp.DataType.Type.USERDEFINED:
+                kind = dt.args.get("kind")
+                if isinstance(kind, exp.Expression) and kind.name in self.clock_types:
+                    return Signal(col, 1, True, is_clock=True)
             if dt.this == exp.DataType.Type.BOOLEAN:
                 return Signal(col, 1, True)
             if dt.this == exp.DataType.Type.BIT:
@@ -413,6 +464,7 @@ class _Parser:
             self.check_unique(name, ident)
             lit, sig = self.reset_literal(name, node)
             self.regs[name] = sig
+            self.reg_pos[name] = self.pos(ident)
             reset[name] = lit
         return reset
 
@@ -482,11 +534,34 @@ class _Parser:
                 if node.alias != name:
                     raise self.err(f"column alias {node.alias} does not match sim column {name}", node)
                 node = node.this
+            node = self.unwrap_clock(name, node)
             want = _ty_of(self.regs[name])
             e, ty = self.lower(node, want)
             self.require_same(ty, want, node, f"{name} is {want} but expression is {ty}")
             nxt[name] = e
         return nxt
+
+    def unwrap_clock(self, name: str, node: exp.Expression) -> exp.Expression:
+        """In a design with declared clocks every register is gated by exactly
+        one of them: `CASE WHEN i.<clock> THEN <next> ELSE s.<self> END`.
+        Record the domain and return <next>."""
+        if not self.clocks:
+            self.domain[name] = "clk"
+            return node
+        hint = f"CASE WHEN i.<clock> THEN <next> ELSE s.{name} END"
+        inner = node
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        if not (isinstance(inner, exp.Case) and inner.this is None and len(inner.args["ifs"]) == 1):
+            raise self.err(f"register {name} needs a clock: {hint}", node)
+        cond = inner.args["ifs"][0].this
+        default = inner.args.get("default")
+        if not (isinstance(cond, exp.Column) and cond.table == "i" and cond.name in self.clocks):
+            raise self.err(f"register {name} needs a clock: {hint}", cond)
+        if not (isinstance(default, exp.Column) and default.table == "s" and default.name == name):
+            raise self.err(f"register {name} must hold when {cond.name} does not rise: {hint}", default or inner)
+        self.domain[name] = cond.name
+        return inner.args["ifs"][0].args["true"]
 
     def parse_lateral(self, lat: exp.Lateral) -> None:
         alias = lat.alias
@@ -665,6 +740,8 @@ class _Parser:
                 raise self.err("unbounded integer in next-state logic", node)
             if name not in self.inputs:
                 raise self.err(f"unknown column: i.{name}", node)
+            if self.inputs[name].is_clock:
+                raise self.err(f"clock {name} may only gate a register (CASE WHEN i.{name} THEN ... ELSE s.<reg> END)", node)
             return Ref(name), _ty_of(self.inputs[name])
         if table in self.laterals:
             cols = self.laterals[table]

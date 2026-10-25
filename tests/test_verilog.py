@@ -61,6 +61,51 @@ module seqdet (
 endmodule
 """
 
+EXPECTED_PULSE_SYNC = """\
+module pulse_sync (
+    input  logic clk_fast,
+    input  logic clk_slow,
+    input  logic rst,
+    input  logic pulse_in,
+    output logic req,
+    output logic ack_f2,
+    output logic pulse_out
+);
+    logic ack_f1;
+    logic req_s1;
+    logic req_s2;
+    logic req_s3;
+    logic busy;
+    always_comb busy = (req != ack_f2);
+
+    always_ff @(posedge clk_fast) begin
+        if (rst) begin
+            req <= 1'b0;
+            ack_f1 <= 1'b0;
+            ack_f2 <= 1'b0;
+        end else begin
+            req <= (req != (pulse_in && (!busy)));
+            ack_f1 <= req_s2;
+            ack_f2 <= ack_f1;
+        end
+    end
+
+    always_ff @(posedge clk_slow) begin
+        if (rst) begin
+            req_s1 <= 1'b0;
+            req_s2 <= 1'b0;
+            req_s3 <= 1'b0;
+            pulse_out <= 1'b0;
+        end else begin
+            req_s1 <= req;
+            req_s2 <= req_s1;
+            req_s3 <= req_s2;
+            pulse_out <= (req_s2 != req_s3);
+        end
+    end
+endmodule
+"""
+
 needs_iverilog = pytest.mark.skipif(shutil.which("iverilog") is None, reason="iverilog not installed")
 needs_sv2v = pytest.mark.skipif(shutil.which("sv2v") is None, reason="sv2v not installed")
 
@@ -72,6 +117,24 @@ def test_incrementer_byte_exact(incrementer_sql):
 def test_seqdet_byte_exact():
     sql = (EXAMPLE_DIRS[EXAMPLE_IDS.index("seqdet")] / "design.sql").read_text()
     assert emit_verilog(parse_design(sql)) == EXPECTED_SEQDET
+
+
+def test_pulse_sync_byte_exact():
+    sql = (EXAMPLE_DIRS[EXAMPLE_IDS.index("pulse_sync")] / "design.sql").read_text()
+    assert emit_verilog(parse_design(sql)) == EXPECTED_PULSE_SYNC
+
+
+def test_multi_clock_testbench_drives_each_clock_from_its_flag():
+    from sqrtl.testbench import render_testbench
+    sql = (EXAMPLE_DIRS[EXAMPLE_IDS.index("pulse_sync")] / "design.sql").read_text()
+    tb = render_testbench(parse_design(sql))
+    assert "    reg tb_e_clk_fast = 1'b0;\n    reg tb_e_clk_slow = 1'b0;\n" in tb
+    assert 'while ($fscanf(tb_stim, "%d,%d,%d,%d\\n", tb_cycle, tb_e_clk_fast, tb_e_clk_slow, pulse_in) == 4)' in tb
+    assert "            #5 clk_fast = tb_e_clk_fast; clk_slow = tb_e_clk_slow;\n" in tb
+    assert "        #5 clk_fast = 1'b1;\n        #5 clk_fast = 1'b0;\n        #5 clk_slow = 1'b1;\n        #5 clk_slow = 1'b0;\n" in tb
+    assert tb.count("\n") < 60
+    single = render_testbench(parse_design((EXAMPLE_DIRS[EXAMPLE_IDS.index("incrementer")] / "design.sql").read_text()))
+    assert "            #5 clk = 1'b1;\n" in single and "tb_e_" not in single
 
 
 def test_switch_emission():

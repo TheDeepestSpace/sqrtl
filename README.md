@@ -17,9 +17,8 @@ sqrtl transpile examples/incrementer      # design.sql -> SystemVerilog on stdou
 sqrtl check     examples/incrementer      # sim + transpile + sv2v + iverilog + diff; exit 0 on match
 ```
 
-What it does not do (v1): one clock, one synchronous reset, no memories, no
-hierarchy, no window functions, no Verilog optimization, PostgreSQL 15+ only.
-See [Future work](#future-work).
+What it does not do: no memories, no hierarchy, no window functions, no
+Verilog optimization, PostgreSQL 15+ only. See [Future work](#future-work).
 
 ## Quick start
 
@@ -220,6 +219,119 @@ endmodule
 In the trace an enum is its ordinal (`idle` = 0), so `expected.csv` is
 encoding-independent.
 
+## Clock domains: the pulse synchronizer
+
+A design may have several clocks. `examples/pulse_sync` moves a pulse from a
+fast clock to a slow one with the classic toggle synchronizer: a request bit
+toggles in the fast domain, two flops in the slow domain synchronize it and an
+edge detector turns each toggle into a one-cycle `pulse_out`, and the slow
+side's view of the request is synchronized back as the acknowledge so that a
+new pulse is only accepted once the previous one has been seen.
+
+```sql
+CREATE DOMAIN clock AS boolean;
+
+CREATE TABLE pulse_sync_in (
+    cycle    integer PRIMARY KEY,
+    clk_fast clock   NOT NULL,   -- true when clk_fast rises at the end of this tick
+    clk_slow clock   NOT NULL,
+    pulse_in boolean NOT NULL    -- clk_fast domain
+);
+
+CREATE VIEW pulse_sync_out AS
+WITH RECURSIVE sim(cycle, req, ack_f1, ack_f2, req_s1, req_s2, req_s3, pulse_out) AS (
+    SELECT 0, false, false, false, false, false, false, false
+    UNION ALL
+    SELECT s.cycle + 1,
+           -- clk_fast domain
+           CASE WHEN i.clk_fast THEN s.req <> (i.pulse_in AND NOT f.busy) ELSE s.req    END,
+           CASE WHEN i.clk_fast THEN s.req_s2                              ELSE s.ack_f1 END,
+           CASE WHEN i.clk_fast THEN s.ack_f1                              ELSE s.ack_f2 END,
+           -- clk_slow domain
+           CASE WHEN i.clk_slow THEN s.req                ELSE s.req_s1    END,
+           CASE WHEN i.clk_slow THEN s.req_s1             ELSE s.req_s2    END,
+           CASE WHEN i.clk_slow THEN s.req_s2             ELSE s.req_s3    END,
+           CASE WHEN i.clk_slow THEN s.req_s2 <> s.req_s3 ELSE s.pulse_out END
+    FROM sim s
+    JOIN pulse_sync_in i ON i.cycle = s.cycle,
+    LATERAL (SELECT s.req <> s.ack_f2 AS busy) f
+)
+SELECT cycle, req, ack_f2, pulse_out FROM sim;
+```
+
+How multiple clocks work:
+
+- **Clocks are ports** of a `clock` type, declared once with
+  `CREATE DOMAIN clock AS boolean`. With clocks declared there is no implicit
+  `clk`; the module gets one input per clock, in table order, then `rst`.
+- **A `sim` row is one tick**, the finest step of the simulation. A stimulus
+  row says which clocks rise at the end of that tick, so `stim.sql` can
+  generate the clock pattern: `pulse_sync` uses
+  `SELECT t, true, t % 3 = 2, t IN (1, 2, 9, 20) FROM generate_series(0, 35) t`,
+  a fast clock every tick and a slow one every third tick.
+- **A register picks its domain by writing what the hardware does**:
+  `CASE WHEN i.<clock> THEN <next> ELSE s.<self> END`. In PostgreSQL that is
+  simply the clock-enable semantics; the transpiler requires exactly this
+  shape for every register, strips it, and emits one
+  `always_ff @(posedge <clock>)` per domain. A clock may not appear anywhere
+  else. Registers that rise on the same tick all read pre-edge state, which is
+  what non-blocking assignments give the Verilog as well.
+- **Reset** is synchronous in every domain; the testbench gives each clock one
+  rising edge while `rst` is high before tick 0.
+- **The CDC lint** warns (never errors) about crossings that are not a
+  synchronizer: a register that reads a register of another domain through
+  logic, a direct copy of a multi-bit foreign register, logic that reads a
+  synchronizer's first stage, and a first stage exposed as an output. The
+  example is clean; `sqrtl transpile` and `check` print warnings as
+  `design.sql:LINE:COL: warning: ...`, and the web UI underlines them.
+
+The generated module:
+
+```systemverilog
+module pulse_sync (
+    input  logic clk_fast,
+    input  logic clk_slow,
+    input  logic rst,
+    input  logic pulse_in,
+    output logic req,
+    output logic ack_f2,
+    output logic pulse_out
+);
+    logic ack_f1;
+    logic req_s1;
+    logic req_s2;
+    logic req_s3;
+    logic busy;
+    always_comb busy = (req != ack_f2);
+
+    always_ff @(posedge clk_fast) begin
+        if (rst) begin
+            req <= 1'b0;
+            ack_f1 <= 1'b0;
+            ack_f2 <= 1'b0;
+        end else begin
+            req <= (req != (pulse_in && (!busy)));
+            ack_f1 <= req_s2;
+            ack_f2 <= ack_f1;
+        end
+    end
+
+    always_ff @(posedge clk_slow) begin
+        if (rst) begin
+            req_s1 <= 1'b0;
+            req_s2 <= 1'b0;
+            req_s3 <= 1'b0;
+            pulse_out <= 1'b0;
+        end else begin
+            req_s1 <= req;
+            req_s2 <= req_s1;
+            req_s3 <= req_s2;
+            pulse_out <= (req_s2 != req_s3);
+        end
+    end
+endmodule
+```
+
 ## Web UI
 
 The repository also ships a browser playground, deployed to GitHub Pages from
@@ -246,7 +358,10 @@ in CI.
 A `design.sql` holds, in this order, any number of enum definitions and then
 exactly two statements:
 
-0. **Enums (optional).** `CREATE TYPE <name> AS ENUM ('label', ...)`. An enum
+0. **Clock type and enums (optional).** `CREATE DOMAIN <name> AS boolean`
+   declares a clock type; a port of that type is a clock (see
+   [Clock domains](#clock-domains-the-pulse-synchronizer)).
+   `CREATE TYPE <name> AS ENUM ('label', ...)`. An enum
    column is `ceil(log2(n))` bits wide (at least 1) and becomes a
    `typedef enum logic [w-1:0] {...} <name>;` whose members are the labels in
    upper case (`'saw_1'` becomes `SAW_1`).
@@ -277,6 +392,7 @@ lateral aliases. A lateral may not contain `FROM`.
 | SQL type  | SystemVerilog          | Notes                                   |
 | --------- | ---------------------- | --------------------------------------- |
 | `boolean` | `logic` (1 bit)        | control signals                         |
+| `clock` domain | `input logic` clock | one `always_ff` per clock; usable only as `CASE WHEN i.<clock> THEN … ELSE s.<self> END` |
 | `bit(n)`  | `logic [n-1:0]`        | data; `n` from 1 to 64                  |
 | enum type | `typedef enum logic [w-1:0]` | `w = ceil(log2(labels))`; compare and `CASE` only |
 | `integer` | error                  | only allowed for `cycle`                |
@@ -310,7 +426,9 @@ keywords. Names must match `[a-z][a-z0-9_]*`.
 
 - Row `cycle = 0` of `sim` is the reset state; row `k+1` is computed from row
   `k` and the stimulus row `cycle = k`. In Verilog, `rst` is synchronous and
-  active-high, asserted for exactly one clock before cycle 0.
+  active-high, asserted for exactly one edge of every clock before cycle 0.
+  With declared clocks a row is one tick and a register changes only on rows
+  whose stimulus flags its clock.
 - A register whose step expression is `s.<self>` holds; one that does not
   mention `s.<self>` is overwritten every cycle. No enables are inferred.
 - The step joins on the stimulus with an inner join, so simulation ends when
@@ -344,6 +462,9 @@ Every row below has a test in `tests/test_parse.py`.
 | simple CASE label is not a literal of the subject's type | `CASE label must be a T literal`                     |
 | simple CASE label repeated                       | `duplicate CASE label X`                                     |
 | every branch of a CASE is a bare label           | `CASE needs a typed branch (write one label as 'label'::enum)` |
+| clocks declared but a register is not gated by one | `register X needs a clock: CASE WHEN i.<clock> THEN <next> ELSE s.X END` |
+| the gate's ELSE is not the register itself       | `register X must hold when C does not rise: ...`             |
+| a clock used in logic                            | `clock C may only gate a register (...)`                     |
 
 `sqrtl check` exits 1 and prints a unified diff when the PostgreSQL trace, the
 Icarus trace and `expected.csv` (if present) disagree. Any sv2v or
@@ -357,7 +478,7 @@ The transpiler emits SystemVerilog, and only SystemVerilog:
 | --- | --- |
 | ports and registers | `logic`; enum-typed ones use their `typedef` |
 | `LATERAL` columns | `logic x; always_comb x = expr;` (a `case` gets a `begin … end` block) |
-| the recursive step | one `always_ff @(posedge clk)` with a synchronous `rst` |
+| the recursive step | one `always_ff @(posedge <clock>)` per clock domain, each with a synchronous `rst` |
 | enums | `typedef enum logic [w-1:0] {…} name;` before the module |
 | simple `CASE` | `case … endcase` |
 
@@ -386,8 +507,10 @@ design.sql --sqlglot--> parse.py --> Design --> verilog.py --> <name>.sv --sv2v-
   statement wherever a statement is allowed.
 - `sqrtl/sim.py` runs the design in a throwaway schema and exports the trace
   and the stimulus as CSV with `COPY`.
-- `sqrtl/check.py` renders a per-design testbench, converts the SystemVerilog
-  with `sv2v`, runs `iverilog -Wall -g2005` and `vvp`, and diffs the traces.
+- `sqrtl/check.py` renders a per-design testbench (every clock driven from
+  the stimulus flags), converts the SystemVerilog with `sv2v`, runs
+  `iverilog -Wall -g2005` and `vvp`, and diffs the traces.
+- `sqrtl/cdc.py` is the structural CDC lint.
 - `sqrtl/trace.py` holds the trace-rendering SQL shared by `sim.py` and
   `sqrtl/web.py`, the entry point the web UI calls under Pyodide.
 
@@ -410,7 +533,9 @@ locally when no server is reachable.
 
 Explicitly out of scope for v1:
 
-- Multiple clock domains, CDC lint.
+- Asynchronous resets, per-domain resets.
+- Multi-bit CDC structures (gray-coded counters, handshake buses) recognized
+  by the lint; today it only accepts 1-bit synchronizers.
 - Memories, register files, tables-as-RAM.
 - `LAG()` / window-function pipelines.
 - Functions as modules, hierarchy.

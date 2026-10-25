@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from sqrtl.parse import Bin, Cond, Lit, Ref, SqrtlError, Switch, parse_design
+from sqrtl.parse import Bin, Cond, Lit, Ref, SqrtlError, Switch, Un, parse_design
 
 INC = """\
 CREATE TABLE incrementer_in (
@@ -273,7 +273,8 @@ def test_web_analyze_roundtrip():
     assert r["ok"] and r["name"] == "incrementer"
     assert [s["name"] for s in r["inputs"]] == ["in_valid", "din"]
     assert r["outputs"] == ["out_valid", "dout"]
-    assert r["wires"] == [{"name": "din_plus1", "width": 8, "is_bool": False, "enum": None}]
+    assert r["wires"] == [{"name": "din_plus1", "width": 8, "is_bool": False, "enum": None, "is_clock": False}]
+    assert r["clocks"] == ["clk"] and r["warnings"] == [] and r["domain"] == {"out_valid": "clk", "dout": "clk"}
     assert r["enums"] == {}
     assert "verilog" not in r
     assert r["systemverilog"].startswith("module incrementer (\n    input  logic")
@@ -367,3 +368,104 @@ def test_err_enums():
     # CREATE TYPE after CREATE TABLE is not a preamble
     fails(sv("CREATE TYPE state_t AS ENUM ('idle', 'saw_1', 'saw_10');\n\n", "") + "CREATE TYPE state_t AS ENUM ('idle');",
           "expected CREATE TABLE then CREATE VIEW")
+
+
+# -- clock domains ----------------------------------------------------------------
+
+PULSE_SYNC = (pytest.importorskip("pathlib").Path(__file__).resolve().parent.parent / "examples" / "pulse_sync" / "design.sql").read_text()
+
+
+def ps(old: str, new: str) -> str:
+    return variant(old, new, PULSE_SYNC)
+
+
+def test_multi_clock_design():
+    d = parse_design(PULSE_SYNC)
+    assert d.clocks == ["clk_fast", "clk_slow"] and d.clock_names() == ["clk_fast", "clk_slow"]
+    assert [s.name for s in d.inputs] == ["clk_fast", "clk_slow", "pulse_in"]
+    assert [s.name for s in d.data_inputs] == ["pulse_in"]
+    assert d.inputs[0].is_clock and d.inputs[0].is_bool and not d.inputs[2].is_clock
+    assert d.domain == {"req": "clk_fast", "ack_f1": "clk_fast", "ack_f2": "clk_fast",
+                        "req_s1": "clk_slow", "req_s2": "clk_slow", "req_s3": "clk_slow", "pulse_out": "clk_slow"}
+    # the clock gate is stripped; what remains is the next-state logic
+    assert d.next["req_s1"] == Ref("req")
+    assert d.next["req"] == Bin("!=", Ref("req"), Bin("&&", Ref("pulse_in"), Un("!", Ref("busy"))))
+    assert d.reg_pos["req"] == (17, 27)
+
+
+def test_single_clock_designs_have_the_implicit_clk():
+    d = parse_design(INC)
+    assert d.clocks == [] and d.clock_names() == ["clk"]
+    assert d.domain == {"out_valid": "clk", "dout": "clk"}
+
+
+def test_err_clocks():
+    fails(ps("CASE WHEN i.clk_slow THEN s.req_s2 <> s.req_s3 ELSE s.pulse_out END", "s.req_s2 <> s.req_s3"),
+          "register pulse_out needs a clock: CASE WHEN i.<clock> THEN <next> ELSE s.pulse_out END")
+    fails(ps("CASE WHEN i.clk_slow THEN s.req_s2 <> s.req_s3 ELSE s.pulse_out END",
+             "CASE WHEN i.pulse_in THEN s.req_s2 <> s.req_s3 ELSE s.pulse_out END"),
+          "register pulse_out needs a clock: CASE WHEN i.<clock> THEN <next> ELSE s.pulse_out END")
+    fails(ps("CASE WHEN i.clk_slow THEN s.req_s2 <> s.req_s3 ELSE s.pulse_out END",
+             "CASE WHEN i.clk_slow THEN s.req_s2 <> s.req_s3 ELSE false END"),
+          "register pulse_out must hold when clk_slow does not rise: CASE WHEN i.<clock> THEN <next> ELSE s.pulse_out END")
+    fails(ps("CASE WHEN i.clk_slow THEN s.req_s2 <> s.req_s3 ELSE s.pulse_out END",
+             "CASE WHEN i.clk_slow THEN s.req_s2 <> s.req_s3 WHEN i.clk_fast THEN false ELSE s.pulse_out END"),
+          "register pulse_out needs a clock: CASE WHEN i.<clock> THEN <next> ELSE s.pulse_out END")
+    fails(ps("LATERAL (SELECT s.req <> s.ack_f2 AS busy) f", "LATERAL (SELECT s.req <> s.ack_f2 AND i.clk_slow AS busy) f"),
+          "clock clk_slow may only gate a register (CASE WHEN i.clk_slow THEN ... ELSE s.<reg> END)")
+    fails(ps("CREATE DOMAIN clock AS boolean;", "CREATE DOMAIN clock AS integer;"),
+          "unsupported statement: CREATE DOMAIN clock AS integer")
+    fails(ps("CREATE DOMAIN clock AS boolean;", "CREATE DOMAIN clk AS boolean;"), "invalid name: clk")
+    fails(ps("clk_fast clock   NOT NULL", "clk_fast clock"), "column clk_fast must be NOT NULL")
+    fails(ps("CREATE DOMAIN clock AS boolean;", ""), "unsupported type clock for column clk_fast")
+
+
+# -- the CDC lint ----------------------------------------------------------------
+
+def warnings_of(src: str) -> list[str]:
+    from sqrtl.cdc import cdc_warnings
+    return [w.message for w in cdc_warnings(parse_design(src))]
+
+
+def test_cdc_lint_is_quiet_for_the_synchronizer_and_single_clock_designs():
+    assert warnings_of(PULSE_SYNC) == []
+    assert warnings_of(INC) == []
+    assert warnings_of(SEQDET) == []
+
+
+def test_cdc_lint_flags_unsynchronized_crossings():
+    # slow-domain logic reading the fast-domain req directly
+    src = ps("CASE WHEN i.clk_slow THEN s.req_s2 <> s.req_s3 ELSE s.pulse_out END",
+             "CASE WHEN i.clk_slow THEN s.req <> s.req_s3 ELSE s.pulse_out END")
+    assert warnings_of(src) == ["pulse_out (clk_slow) reads req (clk_fast) without a synchronizer"]
+    # ...also when the read goes through a wire
+    src = ps("LATERAL (SELECT s.req <> s.ack_f2 AS busy) f", "LATERAL (SELECT s.req <> s.ack_f2 AS busy, s.req <> s.req_s3 AS req_edge) f")
+    src = variant("CASE WHEN i.clk_slow THEN s.req_s2 <> s.req_s3 ELSE s.pulse_out END",
+                  "CASE WHEN i.clk_slow THEN f.req_edge ELSE s.pulse_out END", src)
+    assert warnings_of(src) == ["pulse_out (clk_slow) reads req (clk_fast) without a synchronizer"]
+    # a first stage read through logic
+    src = ps("CASE WHEN i.clk_slow THEN s.req_s2 <> s.req_s3 ELSE s.pulse_out END",
+             "CASE WHEN i.clk_slow THEN s.req_s1 <> s.req_s3 ELSE s.pulse_out END")
+    assert warnings_of(src) == ["pulse_out reads synchronizer stage req_s1 through logic; read it via a second register"]
+    # a first stage as output
+    src = ps("SELECT cycle, req, ack_f2, pulse_out FROM sim", "SELECT cycle, req_s1, pulse_out FROM sim")
+    assert warnings_of(src) == ["synchronizer stage req_s1 is a module output; expose the second stage instead"]
+
+
+def test_cdc_lint_flags_multi_bit_copies():
+    src = """
+CREATE DOMAIN clock AS boolean;
+CREATE TABLE bus_in (cycle integer PRIMARY KEY, clk_a clock NOT NULL, clk_b clock NOT NULL, d bit(8) NOT NULL);
+CREATE VIEW bus_out AS
+WITH RECURSIVE sim(cycle, da, db) AS (
+    SELECT 0, B'00000000'::bit(8), B'00000000'::bit(8)
+    UNION ALL
+    SELECT s.cycle + 1,
+           CASE WHEN i.clk_a THEN i.d ELSE s.da END,
+           CASE WHEN i.clk_b THEN s.da ELSE s.db END
+    FROM sim s
+    JOIN bus_in i ON i.cycle = s.cycle
+)
+SELECT cycle, db FROM sim;
+"""
+    assert warnings_of(src) == ["db (clk_b) copies 8-bit da (clk_a) across clock domains; synchronize a 1-bit flag instead"]

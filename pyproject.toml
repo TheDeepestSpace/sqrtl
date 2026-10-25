@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqrtl"
+version = "0.1.0"
+description = "SQL + RTL: a PostgreSQL query as a hardware description language, transpiled to Verilog"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "sqlglot>=25",
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+sqrtl = "sqrtl.cli:main"
+
+[tool.setuptools]
+packages = ["sqrtl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

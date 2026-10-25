@@ -393,10 +393,7 @@ function colorLanes(host, meta, buses) {
     if (g.id.startsWith("wavelane_draw")) continue;
     const label = g.querySelector("text");
     const name = label ? label.textContent.trim() : "";
-    if (buses.has(name)) {
-      const draw = g.querySelector('g[id^="wavelane_draw"]');
-      if (draw) draw.setAttribute("transform", `translate(${-SLOPE_HALF},0) ${draw.getAttribute("transform") || ""}`.trim());
-    }
+    if (buses.has(name)) alignBusLane(g);
     const cls = name === "clk" ? "lane-clk"
       : name === "rst" ? "lane-rst"
       : name === "cycle" ? "lane-cycle"
@@ -405,6 +402,42 @@ function colorLanes(host, meta, buses) {
       : outputs.has(name) ? "lane-out" : "";
     if (cls) g.classList.add(cls);
   }
+}
+
+// Centre a bus lane's value crossings on the cycle boundaries. WaveDrom draws
+// each crossing in the 6 px after a boundary, so the lane's bricks are shifted
+// left by SLOPE_HALF. That alone would let the first brick poke out before the
+// lane origin and leave the last one short, so the lane is clipped to its own
+// span [0, L] and the final (always flat) brick is cloned 6 px to the right
+// to fill up to L.
+const SVG_NS = "http://www.w3.org/2000/svg";
+function alignBusLane(lane) {
+  const draw = lane.querySelector('g[id^="wavelane_draw"]');
+  if (!draw) return;
+  const bricks = [...draw.querySelectorAll("use")];
+  if (!bricks.length) return;
+  const length = bricks.length * 20;
+  const last = bricks[bricks.length - 1];
+  const filler = last.cloneNode(true);
+  filler.setAttribute("transform", `translate(${length - 20 + SLOPE_HALF})`);
+  draw.insertBefore(filler, last);
+  draw.setAttribute("transform", `translate(${-SLOPE_HALF},0)`);
+
+  const svg = lane.ownerSVGElement;
+  let defs = svg.querySelector("defs");
+  if (!defs) { defs = document.createElementNS(SVG_NS, "defs"); svg.insertBefore(defs, svg.firstChild); }
+  const clip = document.createElementNS(SVG_NS, "clipPath");
+  clip.id = `sqrtl-clip-${lane.id}`;
+  clip.setAttribute("clipPathUnits", "userSpaceOnUse");
+  const rect = document.createElementNS(SVG_NS, "rect");
+  rect.setAttribute("x", "0"); rect.setAttribute("y", "-5");
+  rect.setAttribute("width", String(length)); rect.setAttribute("height", "30");
+  clip.appendChild(rect);
+  defs.appendChild(clip);
+  const wrap = document.createElementNS(SVG_NS, "g");
+  wrap.setAttribute("clip-path", `url(#${clip.id})`);
+  draw.parentNode.insertBefore(wrap, draw);
+  wrap.appendChild(draw);
 }
 
 function showWaveError(msg) {

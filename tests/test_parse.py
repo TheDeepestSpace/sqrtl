@@ -260,3 +260,23 @@ def test_error_positions_point_at_the_offending_token():
     e = fails(variant("SELECT cycle, out_valid, dout FROM sim", "SELECT cycle, out_valid, din FROM sim"), "output din is not a register")
     assert (e.line, e.col) == (18, 26)
     assert re.match(r"\d+:\d+: output din is not a register", str(e))
+
+
+# -- web.py: the browser entry point --------------------------------------
+
+def test_web_analyze_roundtrip():
+    import json
+    from sqrtl.web import analyze, analyze_json
+
+    r = json.loads(analyze_json(INC))
+    assert r == analyze(INC)
+    assert r["ok"] and r["name"] == "incrementer"
+    assert [s["name"] for s in r["inputs"]] == ["in_valid", "din"]
+    assert r["outputs"] == ["out_valid", "dout"]
+    assert r["wires"] == [{"name": "din_plus1", "width": 8, "is_bool": False}]
+    assert r["verilog"].startswith("module incrementer (")
+    assert r["trace_select"] == "SELECT cycle, out_valid::int AS out_valid, dout::bigint AS dout FROM incrementer_out ORDER BY cycle"
+    assert r["stim_select"] == "SELECT cycle, in_valid::int AS in_valid, din::bigint AS din FROM incrementer_in ORDER BY cycle"
+
+    bad = analyze(variant("CASE WHEN i.in_valid THEN n.din_plus1 ELSE s.dout END", "CASE WHEN i.in_valid THEN n.din_plus1 END"))
+    assert bad == {"ok": False, "error": {"message": "CASE needs ELSE", "line": 13, "col": 22}}

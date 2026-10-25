@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>sqrtl · SQL + RTL</title>
+    <meta name="description" content="A PostgreSQL query as a hardware description language: edit the SQL, read the Verilog, watch the waveform. Runs entirely in your browser." />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="style.css" />
+    <script src="vendor/pyodide/pyodide.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="./">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M3 22 L9 22 L12 8 L17 26 L21 14 L24 22 L29 22" />
+        </svg>
+        <span class="brand-name">sqrtl</span>
+        <span class="brand-tag">SQL + RTL — PostgreSQL is the simulator</span>
+      </a>
+      <div class="topbar-controls">
+        <label class="select">
+          <span>Example</span>
+          <select id="example"></select>
+        </label>
+        <button id="reset" class="btn ghost" title="Discard edits and reload the example">Reset</button>
+        <div id="status" class="status" data-state="loading"><span class="dot"></span><span id="status-text">Loading…</span></div>
+        <a class="btn ghost" href="https://github.com/TheDeepestSpace/sqrtl" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="pane pane-sql">
+        <div class="pane-head">
+          <div class="tabs" role="tablist">
+            <button class="tab" role="tab" data-tab="design" aria-selected="true">design.sql</button>
+            <button class="tab" role="tab" data-tab="stim" aria-selected="false">stim.sql</button>
+          </div>
+          <span id="sql-note" class="note"></span>
+        </div>
+        <div class="pane-body">
+          <div id="editor-design" class="editor"></div>
+          <div id="editor-stim" class="editor hidden"></div>
+        </div>
+      </section>
+
+      <section class="pane pane-verilog">
+        <div class="pane-head">
+          <span class="title">Verilog <span id="verilog-name" class="note"></span></span>
+          <div class="actions">
+            <button id="copy" class="btn" title="Copy the Verilog to the clipboard">Copy</button>
+            <button id="download" class="btn ghost" title="Download as a .v file">Download</button>
+          </div>
+        </div>
+        <div class="pane-body">
+          <div id="editor-verilog" class="editor"></div>
+        </div>
+      </section>
+
+      <section class="pane pane-wave">
+        <div class="pane-head">
+          <span class="title">Waveform <span id="wave-note" class="note"></span></span>
+          <div class="legend">
+            <span class="legend-item"><i class="sw sw-in"></i>inputs</span>
+            <span class="legend-item"><i class="sw sw-out"></i>outputs</span>
+            <span class="legend-hint">row <code>k</code> = state after edge <code>k</code>; inputs shown in the cycle they are sampled</span>
+          </div>
+        </div>
+        <div class="pane-body wave-body">
+          <div id="wave" class="wave"></div>
+          <div id="wave-empty" class="wave-empty">Waiting for a simulation…</div>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" hidden></div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

@@ -151,6 +151,27 @@ WITH RECURSIVE sim(cycle, cnt) AS (
 SELECT cycle, cnt FROM sim;
 ```
 
+## Web UI
+
+The repository also ships a browser playground, deployed to GitHub Pages from
+`web/` by `.github/workflows/pages.yml`: a CodeMirror editor for `design.sql`
+and `stim.sql` on the left, the transpiled Verilog (read-only, one-click copy
+or download) on the right, and a WaveDrom waveform of the simulation below,
+with inputs and outputs grouped. It runs entirely client-side: the real
+transpiler executes under [Pyodide](https://pyodide.org) and the real
+simulator is PostgreSQL compiled to WebAssembly via
+[PGlite](https://pglite.dev), so what you see is the same `sqrtl sim` trace.
+Edits re-run on the fly and diagnostics are underlined at `LINE:COL`.
+
+```sh
+npm ci
+npm run build:web     # bundles CodeMirror + WaveDrom, vendors Pyodide + PGlite into web/dist
+npm run serve:web     # http://localhost:8000
+```
+
+The Icarus half of `sqrtl check` is not part of the page; run it locally or
+in CI.
+
 ## The language
 
 A `design.sql` holds exactly two statements, in this order:
@@ -263,6 +284,8 @@ design.sql --sqlglot--> parse.py --> Design --> verilog.py --> <name>.v
   and the stimulus as CSV with `COPY`.
 - `sqrtl/check.py` renders a per-design testbench, runs `iverilog -Wall -g2005`
   and `vvp`, and diffs the traces.
+- `sqrtl/trace.py` holds the trace-rendering SQL shared by `sim.py` and
+  `sqrtl/web.py`, the entry point the web UI calls under Pyodide.
 
 ## Development
 
@@ -289,5 +312,6 @@ Explicitly out of scope for v1:
 - Functions as modules, hierarchy.
 - `CHECK` constraints as assertions.
 - Any optimization of the generated Verilog.
-- A web demo, or support for any database other than PostgreSQL 15+.
+- Support for any database other than PostgreSQL 15+.
+- Running the Icarus equivalence check in the browser.
 - Three-valued logic as X-propagation.

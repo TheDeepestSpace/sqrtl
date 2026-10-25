@@ -10,32 +10,16 @@ import uuid
 
 import psycopg
 
-from .parse import Design, Signal, SqrtlError
+from .parse import Design, SqrtlError
+from .trace import check_contiguous, normalize_csv, stim_select, trace_select
 
 __all__ = ["default_dsn", "run_sim", "normalize_csv"]
 
 DEFAULT_DSN = "postgresql://localhost/sqrtl"
-_TWO64 = 1 << 64
 
 
 def default_dsn() -> str:
     return os.environ.get("SQRTL_DSN") or DEFAULT_DSN
-
-
-def normalize_csv(text: str) -> str:
-    """Normalize line endings and guarantee a single trailing newline."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    return text.rstrip("\n") + "\n"
-
-
-def _render(sig: Signal) -> str:
-    """SQL rendering a signal as the trace's unsigned decimal / 0-1 text."""
-    if sig.is_bool:
-        return f"{sig.name}::int AS {sig.name}"
-    if sig.width < 64:
-        return f"{sig.name}::bigint AS {sig.name}"
-    # bit(64)::bigint is two's complement; fold back to unsigned.
-    return f"mod({sig.name}::bigint::numeric + {_TWO64}, {_TWO64}) AS {sig.name}"
 
 
 def _copy_csv(cur: psycopg.Cursor, select: str) -> str:
@@ -70,19 +54,11 @@ def run_sim(design: Design, design_sql: str, stim_sql: str, dsn: str | None = No
                 raise SqrtlError(f"postgres: {str(e).strip()}") from None
 
             cycles = [row[0] for row in cur.execute(f"SELECT cycle FROM {name}_in ORDER BY cycle")]
-            if not cycles:
-                raise SqrtlError("stimulus is empty")
-            for k, c in enumerate(cycles):
-                if c != k:
-                    raise SqrtlError(f"stimulus has gap at cycle {k}")
+            check_contiguous(cycles)
 
-            stim_cols = ", ".join(["cycle"] + [_render(s) for s in design.inputs])
-            stim_csv = _copy_csv(cur, f"SELECT {stim_cols} FROM {name}_in ORDER BY cycle")
-
-            regs = {r.name: r for r in design.regs}
-            out_cols = ", ".join(["cycle"] + [_render(regs[o]) for o in design.outputs])
+            stim_csv = _copy_csv(cur, stim_select(design))
             try:
-                trace_csv = _copy_csv(cur, f"SELECT {out_cols} FROM {name}_out ORDER BY cycle")
+                trace_csv = _copy_csv(cur, trace_select(design))
             except psycopg.Error as e:
                 raise SqrtlError(f"postgres: {str(e).strip()}") from None
         finally:

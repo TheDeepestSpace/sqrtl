@@ -7,3 +7,6 @@ dist/
 .pytest_cache/
 *.vvp
 /out/
+node_modules/
+web/dist/
+web/.cache/

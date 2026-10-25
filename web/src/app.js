@@ -298,6 +298,13 @@ const skin = structuredClone(wavedrom.waveSkin.default);
 skin[2][2] = WAVE_SKIN_CSS; // ['svg', attrs, ['style', {type}, css], ['defs', ...], ...]
 const waveSkin = { default: skin };
 
+// WaveDrom's '0'/'1' bricks slope into the new level over the 6 px after a
+// cycle boundary, which reads as skew next to the clock's vertical edges.
+// 'h'/'l' use the clock's own glyphs, so 1-bit lanes get a vertical edge
+// exactly on the boundary. Bus lanes have no such glyph; renderWave shifts
+// their bricks by SLOPE_HALF so each value crossing is centred on the boundary.
+const SLOPE_HALF = 6;
+
 function laneFor(sig, values, color) {
   // values: array of strings or null (unknown) per column; '.' compresses repeats.
   let wave = "";
@@ -307,10 +314,10 @@ function laneFor(sig, values, color) {
     if (v === null) { wave += "x"; prev = null; continue; }
     if (v === prev) { wave += "."; continue; }
     prev = v;
-    if (sig.width === 1) wave += v === "1" ? "1" : "0";
+    if (sig.width === 1) wave += v === "1" ? "h" : "l";
     else { wave += color; data.push(v); }
   }
-  const lane = { name: sig.name, wave };
+  const lane = { name: sig.name, wave, bus: sig.width > 1 };
   if (data.length) lane.data = data;
   return lane;
 }
@@ -320,16 +327,18 @@ function renderWave(meta, stimRows, traceRows) {
   const cols = n + 1; // one extra leading column for the reset clock
   const ticks = ["rst", ...Array.from({ length: n }, (_, k) => String(k))];
 
+  // Input lanes stop after the last stimulus row: there is nothing to sample
+  // at the final edge, and the lane ending early says so without a glyph.
   const inputs = meta.inputs.map((sig) =>
-    laneFor(sig, [null, ...traceRows.map((_, k) => (k < stimRows.length ? String(stimRows[k][sig.name]) : null))], "5"));
+    laneFor(sig, [null, ...stimRows.map((r) => String(r[sig.name]))], "5"));
   const regs = Object.fromEntries(meta.regs.map((r) => [r.name, r]));
   const outputs = meta.outputs.map((name) =>
     laneFor(regs[name], [null, ...traceRows.map((r) => String(r[name]))], "7"));
 
   const signal = [
     { name: "clk", wave: "p" + ".".repeat(cols - 1) },
-    { name: "rst", wave: "10" + ".".repeat(cols - 2) },
-    { name: "cycle", wave: "=".repeat(cols), data: ticks },
+    { name: "rst", wave: "hl" + ".".repeat(cols - 2) },
+    { name: "cycle", wave: "=".repeat(cols), data: ticks, bus: true },
   ];
   if (inputs.length) signal.push({}, { name: "INPUTS" }, ...inputs);
   if (outputs.length) signal.push({}, { name: "OUTPUTS" }, ...outputs);
@@ -337,8 +346,10 @@ function renderWave(meta, stimRows, traceRows) {
   const hscale = cols <= 12 ? 3 : cols <= 40 ? 2 : 1;
   const src = { signal, config: { hscale } };
   const host = $("wave");
+  const buses = new Set(signal.filter((l) => l && l.bus).map((l) => l.name));
+  for (const l of signal) if (l) delete l.bus;
   wavedrom.renderWaveElement(0, src, host, waveSkin);
-  colorLanes(host, meta);
+  colorLanes(host, meta, buses);
   for (const r of host.querySelectorAll('rect[style*="fill:white"]')) r.style.fill = "transparent";
   host.classList.remove("stale");
   $("wave-empty").hidden = true;
@@ -348,13 +359,17 @@ function renderWave(meta, stimRows, traceRows) {
 // WaveDrom draws every lane with the same stroke. Tag each lane <g> with its
 // role so the stylesheet can colour inputs, outputs and the clock via
 // `color` (the skin's traces use currentColor, which inherits into <use>).
-function colorLanes(host, meta) {
+function colorLanes(host, meta, buses) {
   const inputs = new Set(meta.inputs.map((s) => s.name));
   const outputs = new Set(meta.outputs);
   for (const g of host.querySelectorAll('g[id^="wavelane_"]')) {
     if (g.id.startsWith("wavelane_draw")) continue;
     const label = g.querySelector("text");
     const name = label ? label.textContent.trim() : "";
+    if (buses.has(name)) {
+      const draw = g.querySelector('g[id^="wavelane_draw"]');
+      if (draw) draw.setAttribute("transform", `translate(${-SLOPE_HALF},0) ${draw.getAttribute("transform") || ""}`.trim());
+    }
     const cls = name === "clk" ? "lane-clk"
       : name === "rst" ? "lane-rst"
       : name === "cycle" ? "lane-cycle"

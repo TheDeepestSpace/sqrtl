@@ -17,7 +17,7 @@ __all__ = ["analyze", "analyze_json"]
 
 
 def _sig(s: Signal) -> dict:
-    return {"name": s.name, "width": s.width, "is_bool": s.is_bool}
+    return {"name": s.name, "width": s.width, "is_bool": s.is_bool, "enum": s.enum}
 
 
 def analyze(design_sql: str) -> dict:
@@ -33,7 +33,9 @@ def analyze(design_sql: str) -> dict:
         "regs": [_sig(s) for s in d.regs],
         "wires": [_sig(d.wire_signals[w]) for w, _ in d.wires],
         "outputs": d.outputs,
+        "enums": d.enums,
         "verilog": emit_verilog(d),
+        "systemverilog": emit_verilog(d, sv=True),
         "stim_select": stim_select(d),
         "trace_select": trace_select(d),
     }

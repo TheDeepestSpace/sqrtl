@@ -18,7 +18,7 @@ from sqlglot.errors import ParseError
 
 __all__ = [
     "SqrtlError",
-    "Ref", "Lit", "Un", "Bin", "Cond", "Expr",
+    "Ref", "Lit", "Un", "Bin", "Cond", "Switch", "Expr",
     "Signal", "Design",
     "parse_design",
     "RESERVED",
@@ -54,6 +54,7 @@ class Lit:
     value: int
     width: int
     base: str = "d"  # 'd' -> 8'd1, 'b' -> 4'b0101
+    label: str | None = None  # enum member name (emitted instead of the number)
 
 
 @dataclass(frozen=True)
@@ -76,7 +77,19 @@ class Cond:
     b: "Expr"
 
 
-Expr = Union[Ref, Lit, Un, Bin, Cond]
+@dataclass(frozen=True)
+class Switch:
+    """A simple CASE: `CASE subject WHEN lit THEN a ... ELSE d END`.
+
+    Emitted as a Verilog `case` statement where a statement is allowed and as
+    a chain of `==` conditionals inside expressions.
+    """
+    subject: "Expr"
+    arms: tuple[tuple[Lit, "Expr"], ...]
+    default: "Expr"
+
+
+Expr = Union[Ref, Lit, Un, Bin, Cond, Switch]
 
 
 @dataclass
@@ -84,9 +97,12 @@ class Signal:
     name: str
     width: int  # 1 for boolean
     is_bool: bool
+    enum: str | None = None  # SQL enum type name, if the signal is an enum
 
     @property
     def sql_type(self) -> str:
+        if self.enum:
+            return self.enum
         return "boolean" if self.is_bool else f"bit({self.width})"
 
 
@@ -100,6 +116,16 @@ class Design:
     wires: list[tuple[str, Expr]]
     next: dict[str, Expr]
     wire_signals: dict[str, Signal] = field(default_factory=dict)
+    enums: dict[str, list[str]] = field(default_factory=dict)  # type name -> labels, in order
+
+    @staticmethod
+    def enum_width(labels: list[str]) -> int:
+        return max(1, (len(labels) - 1).bit_length())
+
+    @staticmethod
+    def member(label: str) -> str:
+        """The Verilog identifier of an enum label."""
+        return label.upper()
 
     def signal(self, name: str) -> Signal:
         for s in self.inputs + self.regs:
@@ -139,10 +165,13 @@ RESERVED = frozenset({"clk", "rst", "cycle", "sim", "s", "i"}) | VERILOG_KEYWORD
 
 @dataclass(frozen=True)
 class _Ty:
-    kind: str  # 'bool' | 'bits'
+    kind: str  # 'bool' | 'bits' | 'enum'
     width: int
+    enum: str | None = None
 
     def __str__(self) -> str:
+        if self.kind == "enum":
+            return self.enum or "enum"
         return "boolean" if self.kind == "bool" else f"bit({self.width})"
 
 
@@ -154,6 +183,8 @@ def _bits(n: int) -> _Ty:
 
 
 def _ty_of(sig: Signal) -> _Ty:
+    if sig.enum:
+        return _Ty("enum", sig.width, sig.enum)
     return _BOOL if sig.is_bool else _bits(sig.width)
 
 
@@ -171,6 +202,7 @@ class _Parser:
         self.laterals: dict[str, dict[str, _Ty]] = {}
         self.wires: list[tuple[str, Expr]] = []
         self.wire_signals: dict[str, Signal] = {}
+        self.enums: dict[str, list[str]] = {}
 
     # -- diagnostics -------------------------------------------------------
 
@@ -207,6 +239,8 @@ class _Parser:
             info = e.errors[0] if e.errors else {}
             raise SqrtlError(f"syntax error: {info.get('description', e)}",
                              info.get("line", 1), info.get("col", 1)) from None
+        while stmts and isinstance(stmts[0], exp.Create) and stmts[0].args.get("kind") == "TYPE":
+            self.parse_enum(stmts.pop(0))
         if (len(stmts) != 2
                 or not isinstance(stmts[0], exp.Create) or stmts[0].args.get("kind") != "TABLE"
                 or not isinstance(stmts[1], exp.Create) or stmts[1].args.get("kind") != "VIEW"):
@@ -223,7 +257,47 @@ class _Parser:
             wires=self.wires,
             next=nxt,
             wire_signals=self.wire_signals,
+            enums=self.enums,
         )
+
+    # -- CREATE TYPE <name> AS ENUM (...) -----------------------------------
+
+    def parse_enum(self, create: exp.Create) -> None:
+        name = self.check_name(create.this.name, create.this)
+        body = create.expression
+        if not (isinstance(body, exp.DataType) and body.this == exp.DataType.Type.ENUM and body.expressions
+                and all(isinstance(e, exp.Literal) and e.is_string for e in body.expressions)):
+            raise self.err(f"CREATE TYPE {name} must be AS ENUM ('label', ...)", create)
+        if name in self.enums:
+            raise self.err(f"duplicate name: {name}", create.this)
+        members = {Design.member(l) for labels in self.enums.values() for l in labels}
+        labels: list[str] = []
+        for lit in body.expressions:
+            label = self.check_name(lit.this, lit)
+            if label in labels or Design.member(label) in members:
+                raise self.err(f"duplicate name: {label}", lit)
+            labels.append(label)
+        self.enums[name] = labels
+
+    def enum_lit(self, enum: str, label: str, node: exp.Expression) -> Lit:
+        labels = self.enums[enum]
+        if label not in labels:
+            raise self.err(f"unknown enum label '{label}' for {enum}", node)
+        return Lit(labels.index(label), Design.enum_width(labels), "d", Design.member(label))
+
+    @staticmethod
+    def _strlit(node: exp.Expression) -> exp.Literal | None:
+        while isinstance(node, exp.Paren):
+            node = node.this
+        return node if isinstance(node, exp.Literal) and node.is_string else None
+
+    def _enum_of(self, dt: exp.DataType | None) -> str | None:
+        if dt is not None and dt.this == exp.DataType.Type.USERDEFINED:
+            kind = dt.args.get("kind")
+            name = kind.name if isinstance(kind, exp.Expression) else str(kind or "")
+            if name in self.enums:
+                return name
+        return None
 
     # -- CREATE TABLE <name>_in --------------------------------------------
 
@@ -271,6 +345,9 @@ class _Parser:
 
     def signal_type(self, col: str, dt: exp.DataType | None, node: exp.Expression) -> Signal:
         if dt is not None:
+            enum = self._enum_of(dt)
+            if enum:
+                return Signal(col, Design.enum_width(self.enums[enum]), False, enum)
             if dt.this == exp.DataType.Type.BOOLEAN:
                 return Signal(col, 1, True)
             if dt.this == exp.DataType.Type.BIT:
@@ -348,7 +425,11 @@ class _Parser:
             operand = inner.this
             while isinstance(operand, exp.Paren):
                 operand = operand.this
-            if sig.is_bool:
+            if sig.enum:
+                lit = self._strlit(operand)
+                if lit is not None:
+                    return self.enum_lit(sig.enum, lit.this, lit), sig
+            elif sig.is_bool:
                 if isinstance(operand, exp.Boolean):
                     return Lit(1 if operand.this else 0, 1, "b"), sig
             elif isinstance(operand, exp.BitString):
@@ -361,7 +442,7 @@ class _Parser:
                 if value >= 1 << sig.width:
                     raise self.err(f"literal {value} does not fit in bit({sig.width})", operand)
                 return Lit(value, sig.width, "d"), sig
-        raise self.err(f"reset value of {name} must be true, false or B'...'::bit(n)", node)
+        raise self.err(f"reset value of {name} must be true, false, B'...'::bit(n) or 'label'::enum", node)
 
     # step: FROM shape, laterals, next-state expressions
     def parse_step(self, sel: exp.Select, reg_nodes: list[exp.Identifier]) -> dict[str, Expr]:
@@ -401,8 +482,8 @@ class _Parser:
                 if node.alias != name:
                     raise self.err(f"column alias {node.alias} does not match sim column {name}", node)
                 node = node.this
-            e, ty = self.lower(node)
             want = _ty_of(self.regs[name])
+            e, ty = self.lower(node, want)
             self.require_same(ty, want, node, f"{name} is {want} but expression is {ty}")
             nxt[name] = e
         return nxt
@@ -468,7 +549,7 @@ class _Parser:
         return node.table, node.name
 
     def require_same(self, a: _Ty, b: _Ty, node: exp.Expression, detail: str) -> None:
-        if a.kind != b.kind:
+        if a.kind != b.kind or a.enum != b.enum:
             raise self.err(f"type mismatch: {detail}", node)
         if a.width != b.width:
             raise self.err(f"width mismatch: {a.width} vs {b.width}", node)
@@ -491,7 +572,14 @@ class _Parser:
             what = self.source(node)
         return self.err(f"unsupported expression: {what}", node)
 
-    def lower(self, node: exp.Expression) -> tuple[Expr, _Ty]:
+    def lower(self, node: exp.Expression, want: _Ty | None = None) -> tuple[Expr, _Ty]:
+        """Lower a sqlglot expression to (Expr, type).
+
+        ``want`` is the type the context expects; it only serves to give a
+        bare enum label ('idle') its type, mirroring how PostgreSQL resolves an
+        unknown-typed literal against the other operand of a comparison, the
+        typed branches of a CASE, or the other arm of the UNION.
+        """
         while isinstance(node, exp.Paren):
             node = node.this
 
@@ -500,6 +588,12 @@ class _Parser:
 
         if isinstance(node, exp.Boolean):
             return Lit(1 if node.this else 0, 1, "b"), _BOOL
+
+        if isinstance(node, exp.Literal) and node.is_string:
+            if want is None or want.kind != "enum":
+                hint = f"'{node.this}'::{want}" if want is not None else f"'{node.this}'::<enum type>"
+                raise self.err(f"string literal '{node.this}' has no enum context (write {hint})", node)
+            return self.enum_lit(want.enum, node.this, node), want
 
         if isinstance(node, (exp.And, exp.Or)):
             op = "&&" if isinstance(node, exp.And) else "||"
@@ -518,8 +612,12 @@ class _Parser:
             return Un("!", a), _BOOL
 
         if isinstance(node, (exp.EQ, exp.NEQ)):
-            a, ta = self.lower(node.this)
-            b, tb = self.lower(node.expression)
+            if self._strlit(node.this) is not None and self._strlit(node.expression) is None:
+                b, tb = self.lower(node.expression)
+                a, ta = self.lower(node.this, tb)
+            else:
+                a, ta = self.lower(node.this)
+                b, tb = self.lower(node.expression, ta)
             self.require_same(ta, tb, node, f"cannot compare {ta} with {tb}")
             return Bin("==" if isinstance(node, exp.EQ) else "!=", a, b), _BOOL
 
@@ -542,7 +640,7 @@ class _Parser:
             return Un("~", a), ta
 
         if isinstance(node, exp.Case):
-            return self.lower_case(node)
+            return self.lower_switch(node) if node.this is not None else self.lower_case(node)
 
         if isinstance(node, exp.Cast):
             return self.lower_cast(node)
@@ -575,24 +673,83 @@ class _Parser:
             return Ref(name), cols[name]
         raise self.err(f"unknown column: {table}.{name}", node)
 
+    def _case_values(self, nodes: list[exp.Expression], ctx: exp.Expression) -> tuple[list[Expr], _Ty]:
+        """Lower the THEN/ELSE values of a CASE to one common type.
+
+        Like PostgreSQL, bare labels take the type of the first typed value;
+        a CASE whose values are all bare labels has no type.
+        """
+        anchor = next((n for n in nodes if self._strlit(n) is None), None)
+        if anchor is None:
+            raise self.err("CASE needs a typed branch (write one label as 'label'::enum)", ctx)
+        _, ty = self.lower(anchor)
+        values: list[Expr] = []
+        for n in nodes:
+            e, t = self.lower(n, ty)
+            self.require_same(t, ty, n, f"CASE branches differ: {t} vs {ty}")
+            values.append(e)
+        return values, ty
+
     def lower_case(self, node: exp.Case) -> tuple[Expr, _Ty]:
-        if node.this is not None:
-            raise self.err("unsupported expression: CASE <expr> WHEN", node)
         default = node.args.get("default")
         if default is None:
             raise self.err("CASE needs ELSE", node)
-        result, ty = self.lower(default)
-        for branch in reversed(node.args["ifs"]):
+        ifs = node.args["ifs"]
+        conds: list[Expr] = []
+        for branch in ifs:
             c, tc = self.lower(branch.this)
             if tc.kind != "bool":
                 raise self.err(f"type mismatch: WHEN needs a boolean condition, got {tc}", branch.this)
-            a, ta = self.lower(branch.args["true"])
-            self.require_same(ta, ty, branch.args["true"], f"CASE branches differ: {ta} vs {ty}")
+            conds.append(c)
+        values, ty = self._case_values([b.args["true"] for b in ifs] + [default], node)
+        result = values[-1]
+        for c, a in zip(reversed(conds), reversed(values[:-1])):
             result = Cond(c, a, result)
         return result, ty
 
+    def case_label(self, node: exp.Expression, tsub: _Ty) -> Lit:
+        """A WHEN label of a simple CASE: a literal of the subject's type."""
+        while isinstance(node, exp.Paren):
+            node = node.this
+        if tsub.kind == "enum":
+            lit = self._strlit(node)
+            if lit is None and isinstance(node, exp.Cast) and self._enum_of(node.to) == tsub.enum:
+                lit = self._strlit(node.this)
+            if lit is not None:
+                return self.enum_lit(tsub.enum, lit.this, lit)
+        elif tsub.kind == "bool":
+            if isinstance(node, exp.Boolean):
+                return Lit(1 if node.this else 0, 1, "b")
+        else:
+            e, t = self.lower(node)
+            if isinstance(e, Lit):
+                self.require_same(t, tsub, node, f"CASE label is {t} but subject is {tsub}")
+                return e
+        raise self.err(f"CASE label must be a {tsub} literal", node)
+
+    def lower_switch(self, node: exp.Case) -> tuple[Expr, _Ty]:
+        default = node.args.get("default")
+        if default is None:
+            raise self.err("CASE needs ELSE", node)
+        subject, tsub = self.lower(node.this)
+        ifs = node.args["ifs"]
+        labels: list[Lit] = []
+        for branch in ifs:
+            lit = self.case_label(branch.this, tsub)
+            if any(l.value == lit.value for l in labels):
+                raise self.err(f"duplicate CASE label {lit.label or lit.value}", branch.this)
+            labels.append(lit)
+        values, ty = self._case_values([b.args["true"] for b in ifs] + [default], node)
+        return Switch(subject, tuple(zip(labels, values[:-1])), values[-1]), ty
+
     def lower_cast(self, node: exp.Cast) -> tuple[Expr, _Ty]:
         to = node.to
+        enum = self._enum_of(to)
+        if enum:
+            lit = self._strlit(node.this)
+            if lit is None:
+                raise self.err(f"only a label can be cast to {enum}", node)
+            return self.enum_lit(enum, lit.this, lit), _Ty("enum", Design.enum_width(self.enums[enum]), enum)
         if to.this == exp.DataType.Type.INT:
             raise self.err("unbounded integer in next-state logic", node)
         if to.this != exp.DataType.Type.BIT:

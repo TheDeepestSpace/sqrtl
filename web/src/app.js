@@ -17,7 +17,12 @@ import { WAVE_SKIN_CSS } from "./waveskin.js";
 
 const $ = (id) => document.getElementById(id);
 const STORAGE_KEY = "sqrtl.v1";
+const TARGET_KEY = "sqrtl.target";
 const SCHEMA = "sqrtl_web";
+
+// Output language: "verilog" (Verilog-2005) or "sv" (SystemVerilog).
+let target = "verilog";
+try { if (localStorage.getItem(TARGET_KEY) === "sv") target = "sv"; } catch { /* ignore */ }
 
 // ---------------------------------------------------------------------------
 // Status / toast
@@ -158,6 +163,27 @@ $("copy").addEventListener("click", async () => {
   }
 });
 
+const EXT = { verilog: "v", sv: "sv" };
+const segButtons = [...document.querySelectorAll(".seg-btn")];
+function applyTarget() {
+  for (const b of segButtons) b.setAttribute("aria-checked", String(b.dataset.target === target));
+  $("verilog-title").textContent = target === "sv" ? "SystemVerilog" : "Verilog";
+  if (lastMeta) showVerilog(lastMeta);
+}
+for (const b of segButtons) {
+  b.addEventListener("click", () => {
+    target = b.dataset.target;
+    try { localStorage.setItem(TARGET_KEY, target); } catch { /* ignore */ }
+    applyTarget();
+  });
+}
+
+function showVerilog(meta) {
+  const text = target === "sv" ? meta.systemverilog : meta.verilog;
+  if (getDoc(verilogView) !== text) setDoc(verilogView, text);
+  $("verilog-name").textContent = `${meta.name}.${EXT[target]}`;
+}
+
 $("download").addEventListener("click", () => {
   const text = getDoc(verilogView);
   if (!text) return;
@@ -165,7 +191,7 @@ $("download").addEventListener("click", () => {
   const blob = new Blob([text], { type: "text/plain" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `${name}.v`;
+  a.download = `${name}.${EXT[target]}`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 });
@@ -238,8 +264,7 @@ async function run() {
   $("sql-note").textContent = "";
   $("sql-note").classList.remove("error");
   lastMeta = result;
-  if (getDoc(verilogView) !== result.verilog) setDoc(verilogView, result.verilog);
-  $("verilog-name").textContent = `${result.name}.v`;
+  showVerilog(result);
 
   setStatus("busy", "Simulating in PostgreSQL…");
   try {
@@ -314,10 +339,10 @@ function laneFor(sig, values, color) {
     if (v === null) { wave += "x"; prev = null; continue; }
     if (v === prev) { wave += "."; continue; }
     prev = v;
-    if (sig.width === 1) wave += v === "1" ? "h" : "l";
+    if (sig.width === 1 && !sig.enum) wave += v === "1" ? "h" : "l";
     else { wave += color; data.push(v); }
   }
-  const lane = { name: sig.name, wave, bus: sig.width > 1 };
+  const lane = { name: sig.name, wave, bus: sig.width > 1 || !!sig.enum };
   if (data.length) lane.data = data;
   return lane;
 }
@@ -329,11 +354,13 @@ function renderWave(meta, stimRows, traceRows) {
 
   // Input lanes stop after the last stimulus row: there is nothing to sample
   // at the final edge, and the lane ending early says so without a glyph.
+  // Enum columns arrive as ordinals (the trace format); show the labels.
+  const show = (sig, v) => (sig.enum && meta.enums[sig.enum] ? (meta.enums[sig.enum][Number(v)] ?? String(v)) : String(v));
   const inputs = meta.inputs.map((sig) =>
-    laneFor(sig, [null, ...stimRows.map((r) => String(r[sig.name]))], "5"));
+    laneFor(sig, [null, ...stimRows.map((r) => show(sig, r[sig.name]))], "5"));
   const regs = Object.fromEntries(meta.regs.map((r) => [r.name, r]));
   const outputs = meta.outputs.map((name) =>
-    laneFor(regs[name], [null, ...traceRows.map((r) => String(r[name]))], "7"));
+    laneFor(regs[name], [null, ...traceRows.map((r) => show(regs[name], r[name]))], "7"));
 
   const signal = [
     { name: "clk", wave: "p" + ".".repeat(cols - 1) },
@@ -404,6 +431,7 @@ async function boot() {
     || examples.find((e) => e.name === "incrementer") || examples[0];
   loadExample(ex, saved && saved.example === ex.name ? saved : {});
 
+  applyTarget();
   await Promise.all([loadPython(), loadPostgres()]);
   setStatus("ready", "Ready");
   run();

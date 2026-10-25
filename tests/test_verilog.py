@@ -5,8 +5,8 @@ import subprocess
 
 import pytest
 
-from sqrtl.parse import Bin, Cond, Lit, Ref, Un, parse_design
-from sqrtl.verilog import emit_expr, emit_verilog
+from sqrtl.parse import Bin, Cond, Lit, Ref, Switch, Un, parse_design
+from sqrtl.verilog import emit_assign, emit_expr, emit_verilog
 
 from conftest import EXAMPLE_DIRS, EXAMPLE_IDS
 
@@ -33,11 +33,99 @@ module incrementer (
 endmodule
 """
 
+EXPECTED_INCREMENTER_SV = """\
+module incrementer (
+    input  logic       clk,
+    input  logic       rst,
+    input  logic       in_valid,
+    input  logic [7:0] din,
+    output logic       out_valid,
+    output logic [7:0] dout
+);
+    logic [7:0] din_plus1;
+    always_comb din_plus1 = (din + 8'd1);
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            out_valid <= 1'b0;
+            dout <= 8'd0;
+        end else begin
+            out_valid <= in_valid;
+            dout <= (in_valid ? din_plus1 : dout);
+        end
+    end
+endmodule
+"""
+
+EXPECTED_SEQDET_SV = """\
+typedef enum logic [1:0] {IDLE = 2'd0, SAW_1 = 2'd1, SAW_10 = 2'd2} state_t;
+
+module seqdet (
+    input  logic   clk,
+    input  logic   rst,
+    input  logic   din,
+    output state_t state,
+    output logic   detected
+);
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            state <= IDLE;
+            detected <= 1'b0;
+        end else begin
+            case (state)
+                IDLE: state <= (din ? SAW_1 : IDLE);
+                SAW_1: state <= (din ? SAW_1 : SAW_10);
+                default: state <= (din ? SAW_1 : IDLE);
+            endcase
+            detected <= ((state == SAW_10) && din);
+        end
+    end
+endmodule
+"""
+
 needs_iverilog = pytest.mark.skipif(shutil.which("iverilog") is None, reason="iverilog not installed")
+needs_sv2v = pytest.mark.skipif(shutil.which("sv2v") is None, reason="sv2v not installed")
 
 
 def test_incrementer_byte_exact(incrementer_sql):
     assert emit_verilog(parse_design(incrementer_sql)) == EXPECTED_INCREMENTER
+
+
+def test_incrementer_systemverilog_byte_exact(incrementer_sql):
+    assert emit_verilog(parse_design(incrementer_sql), sv=True) == EXPECTED_INCREMENTER_SV
+
+
+def test_seqdet_systemverilog_byte_exact():
+    sql = (EXAMPLE_DIRS[EXAMPLE_IDS.index("seqdet")] / "design.sql").read_text()
+    assert emit_verilog(parse_design(sql), sv=True) == EXPECTED_SEQDET_SV
+
+
+def test_seqdet_verilog_uses_localparams_and_case():
+    sql = (EXAMPLE_DIRS[EXAMPLE_IDS.index("seqdet")] / "design.sql").read_text()
+    v = emit_verilog(parse_design(sql))
+    assert "    localparam [1:0] SAW_10 = 2'd2;\n" in v
+    assert "    output reg  [1:0] state,\n" in v
+    assert "            case (state)\n                IDLE: state <= (din ? SAW_1 : IDLE);\n" in v
+    assert "typedef" not in v and "always_ff" not in v
+
+
+def test_switch_emission():
+    sw = Switch(Ref("s"), ((Lit(0, 2, "d", "A"), Ref("x")), (Lit(1, 2, "d", "B"), Switch(Ref("t"), ((Lit(1, 1, "b"), Ref("y")),), Ref("z")))), Lit(3, 2, "d"))
+    assert emit_expr(sw) == "((s == A) ? x : ((s == B) ? ((t == 1'b1) ? y : z) : 2'd3))"
+    assert emit_assign("q", sw, "<=", "  ") == [
+        "  case (s)",
+        "      A: q <= x;",
+        "      B: begin",
+        "          case (t)",
+        "              1'b1: q <= y;",
+        "              default: q <= z;",
+        "          endcase",
+        "      end",
+        "      default: q <= 2'd3;",
+        "  endcase",
+    ]
+    assert emit_assign("q", Ref("x"), "=", "") == ["q = x;"]
 
 
 @pytest.mark.parametrize("example", EXAMPLE_DIRS, ids=EXAMPLE_IDS)
@@ -76,6 +164,48 @@ def _iverilog(tmp_path, verilog: str) -> str:
 @pytest.mark.parametrize("example", EXAMPLE_DIRS, ids=EXAMPLE_IDS)
 def test_examples_compile_without_warnings(tmp_path, example):
     assert _iverilog(tmp_path, emit_verilog(parse_design((example / "design.sql").read_text()))) == ""
+
+
+def _sv2v(tmp_path, systemverilog: str) -> str:
+    (tmp_path / "dut.sv").write_text(systemverilog)
+    r = subprocess.run(["sv2v", "dut.sv"], cwd=tmp_path, capture_output=True, text=True)
+    assert r.returncode == 0 and r.stderr == "", r.stderr
+    return r.stdout
+
+
+@needs_iverilog
+@needs_sv2v
+@pytest.mark.parametrize("example", EXAMPLE_DIRS, ids=EXAMPLE_IDS)
+def test_examples_systemverilog_converts_and_compiles(tmp_path, example):
+    verilog = _sv2v(tmp_path, emit_verilog(parse_design((example / "design.sql").read_text()), sv=True))
+    assert _iverilog(tmp_path, verilog) == ""
+
+
+def test_systemverilog_wire_with_case_uses_always_comb_block():
+    sql = """
+CREATE TYPE op_t AS ENUM ('add', 'sub', 'hold');
+CREATE TABLE alu_in (cycle integer PRIMARY KEY, op op_t NOT NULL, x bit(4) NOT NULL);
+CREATE VIEW alu_out AS
+WITH RECURSIVE sim(cycle, acc, last) AS (
+    SELECT 0, B'0000'::bit(4), 'hold'::op_t
+    UNION ALL
+    SELECT s.cycle + 1, n.nxt, i.op
+    FROM sim s
+    JOIN alu_in i ON i.cycle = s.cycle,
+    LATERAL (SELECT CASE i.op WHEN 'add' THEN (s.acc::int + i.x::int)::bit(4)
+                              WHEN 'sub' THEN (s.acc::int - i.x::int)::bit(4)
+                              ELSE s.acc END AS nxt) n
+)
+SELECT cycle, acc, last FROM sim;
+"""
+    v = emit_verilog(parse_design(sql), sv=True)
+    assert "    input  op_t        op,\n" in v
+    assert "    logic [3:0] nxt;\n    always_comb begin\n        case (op)\n            ADD: nxt = (acc + x);\n" in v
+    assert "    output op_t        last\n" in v
+    plain = emit_verilog(parse_design(sql))
+    assert "    wire [3:0] nxt = ((op == ADD) ? (acc + x) : ((op == SUB) ? (acc - x) : acc));\n" in plain
+    assert "    localparam [1:0] HOLD = 2'd2;\n" in plain
+    assert "    reg [1:0] last;" not in plain and "    output reg  [1:0] last\n" in plain
 
 
 @needs_iverilog

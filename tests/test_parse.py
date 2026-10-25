@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from sqrtl.parse import Bin, Cond, Lit, Ref, SqrtlError, parse_design
+from sqrtl.parse import Bin, Cond, Lit, Ref, SqrtlError, Switch, parse_design
 
 INC = """\
 CREATE TABLE incrementer_in (
@@ -175,7 +175,7 @@ def test_err_type_mismatch():
     fails(with_dout("CASE WHEN i.din = i.in_valid THEN n.din_plus1 ELSE s.dout END"),
           "type mismatch: cannot compare bit(8) with boolean")
     fails(with_dout("CASE WHEN i.in_valid THEN i.in_valid ELSE s.dout END"),
-          "type mismatch: CASE branches differ: boolean vs bit(8)")
+          "type mismatch: CASE branches differ: bit(8) vs boolean")
     fails(with_dout("CASE WHEN i.din THEN n.din_plus1 ELSE s.dout END"),
           "type mismatch: WHEN needs a boolean condition, got bit(8)")
     fails(with_dout("i.in_valid"), "type mismatch: dout is bit(8) but expression is boolean")
@@ -233,7 +233,7 @@ def test_err_misc():
     fails(variant("UNION ALL", "UNION"), "sim must be <base> UNION ALL <step>")
     fails(variant("SELECT 0, false, B'00000000'::bit(8)", "SELECT 0, false"), "base case has 2 columns, sim has 3")
     fails(variant("SELECT 0, false, B'00000000'::bit(8)", "SELECT 1, false, B'00000000'::bit(8)"), "base case must start with cycle 0")
-    fails(variant("SELECT 0, false, B'00000000'::bit(8)", "SELECT 0, false, s.dout"), "reset value of dout must be true, false or B'...'::bit(n)")
+    fails(variant("SELECT 0, false, B'00000000'::bit(8)", "SELECT 0, false, s.dout"), "reset value of dout must be true, false, B'...'::bit(n) or 'label'::enum")
     fails(variant("SELECT s.cycle + 1,", "SELECT s.cycle + 2,"), "step must start with s.cycle + 1")
     fails(with_dout("s.nope"), "unknown column: s.nope")
     fails(with_dout("i.dout"), "unknown column: i.dout")
@@ -273,10 +273,97 @@ def test_web_analyze_roundtrip():
     assert r["ok"] and r["name"] == "incrementer"
     assert [s["name"] for s in r["inputs"]] == ["in_valid", "din"]
     assert r["outputs"] == ["out_valid", "dout"]
-    assert r["wires"] == [{"name": "din_plus1", "width": 8, "is_bool": False}]
+    assert r["wires"] == [{"name": "din_plus1", "width": 8, "is_bool": False, "enum": None}]
+    assert r["enums"] == {}
     assert r["verilog"].startswith("module incrementer (")
+    assert r["systemverilog"].startswith("module incrementer (\n    input  logic")
     assert r["trace_select"] == "SELECT cycle, out_valid::int AS out_valid, dout::bigint AS dout FROM incrementer_out ORDER BY cycle"
     assert r["stim_select"] == "SELECT cycle, in_valid::int AS in_valid, din::bigint AS din FROM incrementer_in ORDER BY cycle"
 
     bad = analyze(variant("CASE WHEN i.in_valid THEN n.din_plus1 ELSE s.dout END", "CASE WHEN i.in_valid THEN n.din_plus1 END"))
     assert bad == {"ok": False, "error": {"message": "CASE needs ELSE", "line": 13, "col": 22}}
+
+
+# -- enums and simple CASE ----------------------------------------------------
+
+SEQDET = (pytest.importorskip("pathlib").Path(__file__).resolve().parent.parent / "examples" / "seqdet" / "design.sql").read_text()
+
+IDLE, SAW_1, SAW_10 = Lit(0, 2, "d", "IDLE"), Lit(1, 2, "d", "SAW_1"), Lit(2, 2, "d", "SAW_10")
+
+
+def test_enum_state_machine_lowers_to_switch():
+    d = parse_design(SEQDET)
+    assert d.enums == {"state_t": ["idle", "saw_1", "saw_10"]}
+    state = d.regs[0]
+    assert (state.name, state.width, state.is_bool, state.enum) == ("state", 2, False, "state_t")
+    assert d.reset["state"] == IDLE
+    nxt = d.next["state"]
+    assert isinstance(nxt, Switch) and nxt.subject == Ref("state")
+    assert [lit for lit, _ in nxt.arms] == [IDLE, SAW_1]
+    assert nxt.arms[0][1] == Cond(Ref("din"), SAW_1, IDLE)
+    assert nxt.arms[1][1] == Cond(Ref("din"), SAW_1, SAW_10)
+    assert nxt.default == Cond(Ref("din"), SAW_1, IDLE)
+    assert d.next["detected"] == Bin("&&", Bin("==", Ref("state"), SAW_10), Ref("din"))
+
+
+def test_enum_width_and_members():
+    from sqrtl.parse import Design
+    assert Design.enum_width(["a"]) == 1
+    assert Design.enum_width(["a", "b"]) == 1
+    assert Design.enum_width(["a", "b", "c"]) == 2
+    assert Design.enum_width([str(i) for i in range(17)]) == 5
+    assert Design.member("saw_1") == "SAW_1"
+
+
+def sv(old: str, new: str) -> str:
+    return variant(old, new, SEQDET)
+
+
+def test_enum_inputs_and_label_on_either_side():
+    src = sv("din   boolean NOT NULL", "din boolean NOT NULL, mode state_t NOT NULL")
+    src = variant("s.state = 'saw_10' AND i.din", "'saw_10' = s.state AND i.din AND i.mode <> 'idle'", src)
+    d = parse_design(src)
+    assert d.inputs[1].enum == "state_t" and d.inputs[1].width == 2
+    det = d.next["detected"]
+    assert det.b == Bin("!=", Ref("mode"), IDLE)
+    assert det.a.a == Bin("==", SAW_10, Ref("state"))
+
+
+def test_simple_case_on_bits_and_bool():
+    src = with_dout("CASE i.din WHEN B'00000000'::bit(8) THEN n.din_plus1 WHEN B'11111111'::bit(8) THEN s.dout ELSE i.din END")
+    src = variant("i.in_valid,\n", "CASE i.in_valid WHEN true THEN false ELSE s.out_valid END,\n", src)
+    d = parse_design(src)
+    sw = d.next["dout"]
+    assert isinstance(sw, Switch) and [l for l, _ in sw.arms] == [Lit(0, 8, "b"), Lit(255, 8, "b")]
+    assert d.next["out_valid"] == Switch(Ref("in_valid"), ((Lit(1, 1, "b"), Lit(0, 1, "b")),), Ref("out_valid"))
+
+
+def test_err_enums():
+    fails(sv("'saw_10' AND", "'saw_11' AND"), "unknown enum label 'saw_11' for state_t")
+    fails(sv("SELECT 0, 'idle'::state_t, false", "SELECT 0, 'nope'::state_t, false"), "unknown enum label 'nope' for state_t")
+    fails(sv("SELECT 0, 'idle'::state_t, false", "SELECT 0, 'idle', false"),
+          "reset value of state must be true, false, B'...'::bit(n) or 'label'::enum")
+    fails(sv("ENUM ('idle', 'saw_1', 'saw_10')", "ENUM ('idle', 'idle', 'saw_10')"), "duplicate name: idle")
+    fails(sv("ENUM ('idle', 'saw_1', 'saw_10')", "ENUM ('Idle', 'saw_1', 'saw_10')"), "invalid name: Idle")
+    fails(sv("CREATE TYPE state_t AS ENUM ('idle', 'saw_1', 'saw_10');", "CREATE TYPE state_t AS (a integer);"),
+          "CREATE TYPE state_t must be AS ENUM ('label', ...)")
+    fails(sv("s.state = 'saw_10' AND i.din", "s.state = 'saw_10' AND i.din AND s.state = B'10'::bit(2)"),
+          "type mismatch: cannot compare state_t with bit(2)")
+    fails(sv("s.state = 'saw_10' AND i.din", "s.state = 'saw_10' AND i.din AND s.state::state_t = s.state"),
+          "only a label can be cast to state_t")
+    fails(sv("WHEN 'idle'  THEN CASE WHEN i.din THEN 'saw_1'::state_t ELSE 'idle'   END",
+             "WHEN 'idle'  THEN CASE WHEN i.din THEN 'saw_1' ELSE 'idle' END"),
+          "CASE needs a typed branch (write one label as 'label'::enum)")
+    fails(sv("WHEN 'saw_1' THEN", "WHEN 'idle' THEN"), "duplicate CASE label IDLE")
+    fails(sv("WHEN 'saw_1' THEN", "WHEN s.state THEN"), "CASE label must be a state_t literal")
+    fails(sv("WHEN 'saw_1' THEN", "WHEN 'later' THEN"), "unknown enum label 'later' for state_t")
+    fails(sv("           ELSE              CASE WHEN i.din THEN 'saw_1'::state_t ELSE 'idle'   END\n", ""), "CASE needs ELSE")
+    fails(with_dout("CASE WHEN i.in_valid THEN 'idle' ELSE s.dout END"),
+          "string literal 'idle' has no enum context (write 'idle'::bit(8))")
+    fails(with_dout("n.din_plus1", "'idle' AS din_plus1"),
+          "string literal 'idle' has no enum context (write 'idle'::<enum type>)")
+    fails(sv("CREATE TYPE state_t", "CREATE TYPE module"), "invalid name: module")
+    fails(sv("din   boolean NOT NULL", "din other_t NOT NULL"), "unsupported type other_t for column din")
+    # CREATE TYPE after CREATE TABLE is not a preamble
+    fails(sv("CREATE TYPE state_t AS ENUM ('idle', 'saw_1', 'saw_10');\n\n", "") + "CREATE TYPE state_t AS ENUM ('idle');",
+          "expected CREATE TABLE then CREATE VIEW")

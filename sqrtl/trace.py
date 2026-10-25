@@ -18,7 +18,10 @@ def normalize_csv(text: str) -> str:
 
 
 def render_column(sig: Signal) -> str:
-    """SQL rendering a signal as the trace's 0/1 (boolean) or unsigned decimal (bit(n))."""
+    """SQL rendering a signal as the trace's 0/1 (boolean), unsigned decimal
+    (bit(n)) or ordinal (enum, first label = 0)."""
+    if sig.enum:
+        return f"(array_position(enum_range(NULL::{sig.enum}), {sig.name}) - 1) AS {sig.name}"
     if sig.is_bool:
         return f"{sig.name}::int AS {sig.name}"
     if sig.width < 64:

@@ -11,6 +11,10 @@ RUN apt update && apt upgrade -y && \
     iverilog postgresql-16 postgresql-client-16 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# sv2v (SystemVerilog -> Verilog) for `sqrtl check --sv`; pinned release binary.
+COPY scripts/install-sv2v.sh /tmp/install-sv2v.sh
+RUN /tmp/install-sv2v.sh /usr/local/bin && rm /tmp/install-sv2v.sh
+
 # System-wide pip is fine inside the container.
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 RUN pip install --no-cache-dir "sqlglot>=25" "psycopg[binary]>=3.1" "pytest>=8"

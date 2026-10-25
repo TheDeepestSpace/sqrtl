@@ -47,10 +47,14 @@
 
       <section class="pane pane-verilog">
         <div class="pane-head">
-          <span class="title">Verilog <span id="verilog-name" class="note"></span></span>
+          <span class="title"><span id="verilog-title">Verilog</span> <span id="verilog-name" class="note"></span></span>
           <div class="actions">
-            <button id="copy" class="btn" title="Copy the Verilog to the clipboard">Copy</button>
-            <button id="download" class="btn ghost" title="Download as a .v file">Download</button>
+            <div class="seg" role="radiogroup" aria-label="Target language">
+              <button class="seg-btn" data-target="verilog" role="radio" aria-checked="true" title="Verilog-2005: wire/reg, always @(posedge clk), enums as localparams">Verilog</button>
+              <button class="seg-btn" data-target="sv" role="radio" aria-checked="false" title="SystemVerilog: logic, typedef enum, always_comb, always_ff">SystemVerilog</button>
+            </div>
+            <button id="copy" class="btn" title="Copy to the clipboard">Copy</button>
+            <button id="download" class="btn ghost" title="Download as a file">Download</button>
           </div>
         </div>
         <div class="pane-body">

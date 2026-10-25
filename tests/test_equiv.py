@@ -14,6 +14,8 @@ from sqrtl.sim import normalize_csv, run_sim
 from conftest import EXAMPLE_DIRS, EXAMPLE_IDS
 
 needs_iverilog = pytest.mark.skipif(shutil.which("iverilog") is None, reason="iverilog not installed")
+TARGETS = [pytest.param(False, id="verilog"),
+           pytest.param(True, id="sv", marks=pytest.mark.skipif(shutil.which("sv2v") is None, reason="sv2v not installed"))]
 
 
 def _load(example):
@@ -30,11 +32,12 @@ def test_sim_matches_expected(dsn, example):
 
 
 @needs_iverilog
+@pytest.mark.parametrize("sv", TARGETS)
 @pytest.mark.parametrize("example", EXAMPLE_DIRS, ids=EXAMPLE_IDS)
-def test_check(dsn, example):
+def test_check(dsn, example, sv):
     design, design_sql, stim_sql = _load(example)
     out = io.StringIO()
-    rc = check(design, design_sql, stim_sql, (example / "expected.csv").read_text(), dsn, out=out)
+    rc = check(design, design_sql, stim_sql, (example / "expected.csv").read_text(), dsn, out=out, sv=sv)
     assert rc == 0, out.getvalue()
     assert out.getvalue().startswith("ok:")
 

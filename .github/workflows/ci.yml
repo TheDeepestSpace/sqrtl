@@ -29,6 +29,7 @@ jobs:
           --health-retries 10
     env:
       SQRTL_DSN: postgresql://postgres:postgres@localhost:5432/sqrtl
+      PATH: /home/runner/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,6 +40,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends iverilog
           iverilog -V | head -n1
 
+      - name: Install sv2v (SystemVerilog -> Verilog, for `sqrtl check --sv`)
+        run: scripts/install-sv2v.sh "$HOME/.local/bin"
+
       - name: Install sqrtl
         run: |
           python3 -m venv .venv
@@ -48,8 +52,9 @@ jobs:
       - name: Test
         run: .venv/bin/pytest
 
-      - name: Check every example
+      - name: Check every example (Verilog-2005 and SystemVerilog via sv2v)
         run: |
           for d in examples/*/; do
             .venv/bin/sqrtl check "$d"
+            .venv/bin/sqrtl check --sv "$d"
           done

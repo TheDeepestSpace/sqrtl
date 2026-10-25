@@ -23,17 +23,29 @@ def udiff(a: str, b: str, a_name: str, b_name: str) -> str:
         a.splitlines(keepends=True), b.splitlines(keepends=True), a_name, b_name))
 
 
-def run_icarus(design: Design, verilog: str, stim_csv: str, workdir: Path) -> str:
+def run_icarus(design: Design, verilog: str, stim_csv: str, workdir: Path, sv: bool = False) -> str:
     """Compile and run the design under Icarus; return the trace CSV.
 
-    Any iverilog diagnostic (warnings included) is a failure.
+    With ``sv`` the text is SystemVerilog: it is first converted to Verilog
+    with sv2v (a tool, not a package dependency) and the converted file is
+    what Icarus compiles. Any iverilog diagnostic (warnings included) is a
+    failure.
     """
-    for tool in ("iverilog", "vvp"):
+    for tool in ("iverilog", "vvp") + (("sv2v",) if sv else ()):
         if shutil.which(tool) is None:
-            raise SqrtlError(f"{tool} not found on PATH (install Icarus Verilog)")
+            hint = "see scripts/install-sv2v.sh" if tool == "sv2v" else "install Icarus Verilog"
+            raise SqrtlError(f"{tool} not found on PATH ({hint})")
     dut = workdir / f"{design.name}.v"
     tb = workdir / "tb.v"
-    dut.write_text(verilog)
+    if sv:
+        src = workdir / f"{design.name}.sv"
+        src.write_text(verilog)
+        r = subprocess.run(["sv2v", src.name], cwd=workdir, capture_output=True, text=True)
+        if r.returncode != 0 or r.stderr.strip():
+            raise SqrtlError(f"sv2v {'failed' if r.returncode else 'warned'}:\n{r.stderr.strip()}")
+        dut.write_text(r.stdout)
+    else:
+        dut.write_text(verilog)
     tb.write_text(render_testbench(design))
     (workdir / STIM_FILE).write_text(stim_csv)
 
@@ -53,19 +65,20 @@ def run_icarus(design: Design, verilog: str, stim_csv: str, workdir: Path) -> st
 
 
 def check(design: Design, design_sql: str, stim_sql: str, expected_csv: str | None,
-          dsn: str | None = None, out: TextIO | None = None, keep: Path | None = None) -> int:
+          dsn: str | None = None, out: TextIO | None = None, keep: Path | None = None,
+          sv: bool = False) -> int:
     """Run sim + transpile + iverilog and diff the traces. Returns 0 or 1."""
     out = out if out is not None else sys.stdout
     trace_pg, stim_csv = run_sim(design, design_sql, stim_sql, dsn)
-    verilog = emit_verilog(design)
+    verilog = emit_verilog(design, sv=sv)
 
     if keep is not None:
         keep.mkdir(parents=True, exist_ok=True)
-        trace_iv = run_icarus(design, verilog, stim_csv, keep)
+        trace_iv = run_icarus(design, verilog, stim_csv, keep, sv=sv)
         (keep / "trace_pg.csv").write_text(trace_pg)
     else:
         with tempfile.TemporaryDirectory(prefix="sqrtl_") as tmp:
-            trace_iv = run_icarus(design, verilog, stim_csv, Path(tmp))
+            trace_iv = run_icarus(design, verilog, stim_csv, Path(tmp), sv=sv)
 
     ok = True
     diff = udiff(trace_pg, trace_iv, "trace_pg.csv", "trace_iv.csv")
@@ -79,6 +92,6 @@ def check(design: Design, design_sql: str, stim_sql: str, expected_csv: str | No
             out.write(diff)
     cycles = trace_pg.count("\n") - 1
     if ok:
-        out.write(f"ok: {design.name}: postgres and icarus traces match over {cycles} cycles"
+        out.write(f"ok: {design.name}{' (sv2v)' if sv else ''}: postgres and icarus traces match over {cycles} cycles"
                   f"{' and equal expected.csv' if expected_csv is not None else ''}\n")
     return 0 if ok else 1
